@@ -52,7 +52,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.join(HERE, "root")
 
 PKG_NAME = "luci-app-adhfilter"
-PKG_VERSION = "1.0.0"
+PKG_VERSION = "1.1.0"
 PKG_RELEASE = "1"
 PKG_ARCH = "all"
 PKG_LICENSE = "MIT"
@@ -164,6 +164,18 @@ def ar_archive(members):
 
 
 # ────────────────────────────── 收集文件树 ──────────────────────────────
+
+# 🔴 macOS 会在你翻过的每个目录里自动撒垃圾文件，**绝不能打进包**：
+# 装到路由器上会凭空多出一个 /.DS_Store（毫无用处），而且会暴露打包机的系统。
+# （实测踩过：ipk 里混进了 ./.DS_Store 6148 字节。Finder 一浏览目录就会重新生成，
+#   所以只在打包时过滤、不靠手工删除。）
+JUNK_NAMES = {".DS_Store", ".Spotlight-V100", ".Trashes", ".fseventsd", ".AppleDouble"}
+
+
+def is_junk(name):
+    return name in JUNK_NAMES or name.startswith("._")
+
+
 def collect_data_entries():
     if not os.path.isdir(ROOT_DIR):
         sys.exit(f"!! 找不到 {ROOT_DIR}（应该在插件目录里运行本脚本）")
@@ -174,6 +186,9 @@ def collect_data_entries():
 
     for dirpath, dirnames, filenames in os.walk(ROOT_DIR):
         dirnames.sort()
+        # 就地裁剪（别用 dirnames = ...），否则 os.walk 会照样递归进垃圾目录
+        dirnames[:] = [d for d in dirnames if not is_junk(d)]
+
         rel = os.path.relpath(dirpath, ROOT_DIR)
         if rel != ".":
             arc = "./" + rel.replace(os.sep, "/") + "/"
@@ -182,6 +197,8 @@ def collect_data_entries():
                 entries.append((arc, dir_mode(), None))
 
         for fn in sorted(filenames):
+            if is_junk(fn):
+                continue
             full = os.path.join(dirpath, fn)
             if rel == ".":
                 arc = "./" + fn

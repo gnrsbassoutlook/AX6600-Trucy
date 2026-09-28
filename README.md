@@ -59,6 +59,31 @@ AX6600-Trucy/
 - 搬回左边 = `del`（规则 + 静态绑定一起撤）
 - 支持手动填 IP、改名、一键自检
 - 识别随机化 MAC（首字节第二 bit = 1），会提示你先关掉「私有 Wi-Fi 地址」
+- **可多选批量搬运**（勾几台点一次，串行执行、逐台报结果）
+- **🏷 自定义备注** —— 给设备起一个只有你看得懂的标记，**支持中文**
+
+### 🏷 备注：为什么不能拿「设备名」认设备
+
+列表里的设备名是**设备自己上报**的（手机「设置 → 通用 → 关于本机 → 名称」那一栏），
+也就是说 —— **孩子在自己手机上随手就能把它改掉**。今天叫 `Watch`，明天改叫 `MacBookAir`，
+你在路由器这边是看不出来的。
+
+所以插件给每台设备加了一个**只有你写得了**的备注：
+
+| | 设备自报的名字 | 🏷 备注 |
+|---|---|---|
+| 谁能改 | 设备自己（孩子） | **只有路由器管理员** |
+| 存在哪 | DHCP 租约（临时） | `/etc/adhfilter.labels`（持久） |
+| 中文 | 不行（会让 dnsmasq 崩溃） | **可以** |
+| 主键 | IP | **MAC**（设备换 IP 也不丢） |
+| 读写代价 | 改一次要重启 dnsmasq（5~15 秒） | **瞬间生效，不重启任何服务** |
+
+点设备右侧的 **🏷** 就能写。写了备注的设备，名字会用蓝色 + 标签图标标出来，
+下面一行仍然显示 IP 和 MAC —— **后两个才是设备真正的身份，改不掉**。
+
+> 旁边的 **✎** 是另一回事：那是改「路由器侧写进 dnsmasq 的设备名」，
+> 只能字母/数字/下划线/连字符，改一次要重启 dnsmasq。
+> 只想自己认人 → 用 **🏷**；想让全家设备/DNS 日志里都显示这个名字 → 才用 **✎**。
 
 ### 依赖
 
@@ -76,9 +101,9 @@ libc, luci-base, luci-compat, luci-lua-runtime
 **方式一：ipk（推荐）**
 
 ```sh
-opkg install luci-app-adhfilter_1.0.0-1_all.ipk
+opkg install luci-app-adhfilter_1.1.0-1_all.ipk
 # 如果报依赖问题（比如 rom 里包名对不上）：
-opkg install --force-depends luci-app-adhfilter_1.0.0-1_all.ipk
+opkg install --force-depends luci-app-adhfilter_1.1.0-1_all.ipk
 ```
 
 **方式二：源码直接铺文件**
@@ -99,6 +124,9 @@ sh luci-app-adhfilter/uninstall.sh
 
 两种方式都**只删界面**，已经设好的过滤规则（firewall 里的锚点、dhcp 里的静态绑定）**一律保留**。
 要连过滤一起撤，用 `adhfilter del <IP>`。
+
+`uninstall.sh` 会额外删掉 `/etc/adhfilter.labels`（🏷 备注文件）—— 那个文件只有界面能读写，
+留着就是一份没主的数据。舍不得就先备份。
 
 ### 自己打包 ipk
 
@@ -122,6 +150,9 @@ gzip( tar( ./debian-binary + ./data.tar.gz + ./control.tar.gz ) )
 - ❌ 外面的 gzip **不能省**：裸 tar 会被 opkg 判 `Malformed package file`
 - ❌ control 里**别写 `Section-Priority:`**：opkg 会打印
   `ERROR: truncating field 4 ... to 5 byte`（虽然装得上，但 DB 字段是截断的）
+- ❌ **别把 macOS 的 `.DS_Store` 打进包**：Finder 每浏览一个目录就会生成一个，
+  装到路由器上会凭空多出 `/.DS_Store`。`build-ipk.py` 已内置过滤
+  （`JUNK_NAMES` + `._*`，且对目录用 `dirnames[:] = ...` 就地裁剪，否则 `os.walk` 照样递归进去）
 
 复现方式见 `build-ipk.py` 顶部的注释。
 

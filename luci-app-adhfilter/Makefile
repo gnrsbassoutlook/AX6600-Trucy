@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-adhfilter
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.1.0
 PKG_RELEASE:=1
 
 PKG_LICENSE:=MIT
@@ -15,7 +15,8 @@ PKG_MAINTAINER:=gnrsbassoutlook
 
 LUCI_TITLE:=AdhFilter - 按设备管理 AdGuard Home 过滤
 LUCI_DESCRIPTION:=Give /usr/bin/adhfilter a web UI: list devices, pin IP, \
- join/leave the filtering list, rename, self-check.
+ join/leave the filtering list, rename, self-check, and write your own \
+ device labels (so a device renaming itself can't hide from you).
 LUCI_DEPENDS:=
 LUCI_PKGARCH:=all
 

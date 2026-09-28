@@ -57,6 +57,11 @@
 .af-item-sub { display:block; font-size:11px; color:var(--af-dim);
 	font-family:ui-monospace,Menlo,Consolas,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
+/* 你自己写的备注：用主色 + 标签图标标出来，和设备自报的名字一眼区分。
+   设备名是设备自己上报的（孩子能改），备注只存在路由器上、谁也改不掉。 */
+.af-item-nm.af-tagged { color:var(--af-brand); }
+.af-item-nm.af-tagged::before { content:"\1F3F7"; font-size:11px; margin-right:2px; }
+
 .af-mid { display:flex; flex-direction:column; justify-content:center; gap:10px; }
 .af-mid .af-btn { width:100%; padding:8px 4px; }
 
@@ -115,7 +120,7 @@
 			<span class="af-title">设备过滤名单</span>
 			<span class="af-sub" id="af-sub"></span>
 			<span class="af-spacer"></span>
-			<button class="af-btn af-ghost" id="af-refresh">刷新</button>
+			<button type="button" class="af-btn af-ghost" id="af-refresh">刷新</button>
 		</div>
 		<div class="af-body">
 			<div class="af-xfer">
@@ -129,8 +134,8 @@
 				</div>
 
 				<div class="af-mid">
-					<button class="af-btn af-primary" id="af-do-block" disabled title="把勾选的设备加入 NSFW 封禁">封禁 →</button>
-					<button class="af-btn af-ghost" id="af-do-unblock" disabled title="把勾选的设备移出封禁，恢复正常上网">← 解禁</button>
+					<button type="button" class="af-btn af-primary" id="af-do-block" disabled title="把勾选的设备加入 NSFW 封禁">封禁 →</button>
+					<button type="button" class="af-btn af-ghost" id="af-do-unblock" disabled title="把勾选的设备移出封禁，恢复正常上网">← 解禁</button>
 				</div>
 
 				<div class="af-col">
@@ -145,12 +150,15 @@
 
 			<div class="af-manual">
 				<input class="af-input" id="af-manual-ip" placeholder="设备不在上面？手动输入 IP，例如 192.168.1.120">
-				<button class="af-btn af-primary" id="af-manual-go">加入封禁</button>
+				<button type="button" class="af-btn af-primary" id="af-manual-go">加入封禁</button>
 			</div>
 			<div class="af-tip">
 				勾选后点中间按钮搬运，或直接<b>双击</b>某一台来回搬。加入封禁时会<b>自动固定它的 IP</b>并同时绑定 MAC
 				（双保险，设备换 IP 也不会漏）。设备必须在线（连过 WiFi、拿过 IP）才能操作。
 				<br><b>搬动即刻生效</b>，无需再点页面下方的「保存 / 保存 &amp; 应用」。
+				<br><b>🏷 写备注</b> —— 给设备起个只有你看得懂的标记（<b>支持中文</b>，最多 32 个字）。
+				设备自己上报的名字（手机里的「名称」）孩子随手就能改掉，而备注只存在路由器上、谁也动不了它，
+				拿它认人最稳。<b>✎</b> 是另一个东西：改路由器侧写进 dnsmasq 的设备名，只能是字母/数字/下划线/连字符。
 			</div>
 		</div>
 	</div>
@@ -159,7 +167,7 @@
 		<div class="af-hd">
 			<span class="af-title">自检</span>
 			<span class="af-spacer"></span>
-			<button class="af-btn af-ghost" id="af-check-go">运行自检</button>
+			<button type="button" class="af-btn af-ghost" id="af-check-go">运行自检</button>
 		</div>
 		<div class="af-body">
 			<pre class="af-pre" id="af-check-out">点右上角「运行自检」，检查锚点、dnsmasq、端口是否都正常。</pre>
@@ -240,37 +248,60 @@
 	}
 
 	function itemHtml(v, side) {
-		var nm = v.bindname || v.name || "(未知设备)";
-		var sub = v.ip + (v.mac ? "  ·  " + v.mac : "");
+		/* 显示名优先级：**你自己写的备注** > 路由器上的绑定名 > 设备自报的名字。
+		   设备自报的名字（手机/电脑的"名称"）是设备说了算的 —— 孩子随手就能改，
+		   所以拿它认人不可靠。备注只存在路由器本地，跟 dnsmasq 一点关系没有，
+		   可以写中文、随便改，谁也动不了它。 */
+		var devnm = v.bindname || v.name || "(未知设备)";
+		var lbl   = v.label || "";
+		var nm    = lbl || devnm;
+
+		/* 副标题：有备注时把设备自报的名字也留一行做对照，没备注就不重复显示。
+		   IP 和 MAC 恒定显示 —— 这两个才是设备的唯一身份。 */
+		var parts = [];
+		if (lbl && devnm !== "(未知设备)") { parts.push(devnm); }
+		parts.push(v.ip);
+		if (v.mac) { parts.push(v.mac); }
+		var sub = parts.join("  ·  ");
 
 		var badges = "";
 		if (v.bound)   { badges += '<span class="af-b af-b-pin">已固定</span>'; }
 		if (!v.online) { badges += '<span class="af-b af-b-idle">离线</span>'; }
 		if (v.randmac) { badges += '<span class="af-b af-b-rand" title="这台设备开了「私有/随机 Wi-Fi 地址」。它每次连网都会换 MAC，导致 MAC 规则和静态绑定失效 → 换 IP 后就漏过滤了。建议在该设备上关掉这个开关。">随机MAC</span>'; }
 
+		/* 备注的主键：优先 MAC（设备换 IP 也不丢备注），没有 MAC 才退回 IP */
+		var key = v.key || v.mac || v.ip;
+
 		return '<label class="af-item" data-ip="' + esc(v.ip) + '" data-side="' + side + '">'
 		     +   '<input type="checkbox" class="af-ck">'
 		     +   '<span class="af-item-main">'
-		     +     '<span class="af-item-nm">' + esc(nm) + '</span>'
+		     +     '<span class="af-item-nm' + (lbl ? ' af-tagged' : '') + '">' + esc(nm) + '</span>'
 		     +     '<span class="af-item-sub">' + esc(sub) + '</span>'
 		     +   '</span>'
 		     +   badges
+		     +   '<button type="button" class="af-mini" data-label="' + esc(key) + '" title="写个备注（只有你看得到、支持中文，孩子改设备名也不影响）">🏷</button>'
 		     +   (side === "blk"
-		            ? '<button type="button" class="af-mini" data-rename="' + esc(v.ip) + '" title="改个好认的名字">✎</button>'
+		            ? '<button type="button" class="af-mini" data-rename="' + esc(v.ip) + '" title="改路由器侧设备名（会写进 dnsmasq，只能是字母/数字/下划线/连字符）">✎</button>'
 		            : '')
 		     + '</label>';
 	}
+
+	/* 备注映射：key(MAC 或 IP) -> 备注文本。
+	   点 🏷 改备注时用它回填当前值（这样点开就能改，不用重新输一遍）。 */
+	var LABELMAP = {};
 
 	function render(d) {
 		renderStats(d);
 
 		var devs = d.devices || [];
 		var free = [], blk = [], rands = [];
+		LABELMAP = {};
 		for (var i = 0; i < devs.length; i++) {
 			(devs[i].filtered ? blk : free).push(devs[i]);
 			if (devs[i].randmac) {
-				rands.push(devs[i].bindname || devs[i].name || devs[i].ip);
+				rands.push(devs[i].label || devs[i].bindname || devs[i].name || devs[i].ip);
 			}
+			if (devs[i].key && devs[i].label) { LABELMAP[devs[i].key] = devs[i].label; }
 		}
 
 		if (rands.length) {
@@ -339,6 +370,12 @@
 		});
 	}
 
+	/* 单台操作的最坏耗时：block 会先 bind（重启 dnsmasq：固定 sleep 4 秒，再最多校验 15 秒），
+	   再 add（重载防火墙，最多校验 15 秒），叠加接近 40 秒。这里给 75 秒余量。
+	   ⚠️ 必须有这个超时：老版 xhr.js 在极端情况下不回调，没有兜底的话 busy()
+	   的 pointer-events:none 会一直挂着，整个页面点不动，后面几台也永远等不到回合。 */
+	var XHR_WAIT_MS = 75000;
+
 	function runSeq(ips, act, label) {
 		if (!ips.length) { return; }
 
@@ -357,10 +394,24 @@
 				return;
 			}
 			var ip = ips[i++];
-			toast(label + "中 " + i + "/" + ips.length + "：" + ip
+			var n  = i;
+			toast(label + "中 " + n + "/" + ips.length + "：" + ip
 				+ "（每台约 5～15 秒，正在重启 dnsmasq，请勿关闭页面）", "");
 
+			/* advanced 保证「超时」和「回调」里只有先到的那个推进队列，另一个静默作废 */
+			var advanced = false;
+			var timer = setTimeout(function () {
+				if (advanced) { return; }
+				advanced = true;
+				bad.push(ip + "：超时（" + (XHR_WAIT_MS / 1000)
+					+ " 秒内没收到路由器回应，请刷新看实际结果）");
+				step();
+			}, XHR_WAIT_MS);
+
 			new XHR().post(API + "/action", { action: act, target: ip }, function (x) {
+				if (advanced) { return; }
+				advanced = true;
+				clearTimeout(timer);
 				var d = jparse(x);
 				if (d && d.ok) { okN++; }
 				else {
@@ -394,6 +445,32 @@
 		});
 	}
 
+	/* 备注 = 只属于你的标签。存在路由器上的 /etc/adhfilter.labels，
+	   跟 dnsmasq、跟过滤规则**完全无关** → 可以写中文、随时改，
+	   设备自报的名字被孩子改掉、或者设备换了 IP，都不影响它（主键用的是 MAC）。
+	   读写都只碰这一个本地小文件，**立刻生效、不重启任何服务**。 */
+	function setLabel(key) {
+		var cur = LABELMAP[key] || "";
+		var nn = window.prompt(
+			"给这台设备写个备注（只有你看得到，支持中文）\n"
+			+ "它只存在路由器上；孩子在自己设备里改名字也影响不到它。\n"
+			+ "留空 = 清除备注。", cur);
+		if (nn === null) { return; }
+		nn = String(nn).trim();
+		if (nn.length > 32) {
+			toast("备注太长了（最多 32 个字符）", "bad");
+			return;
+		}
+		busy(true);
+		new XHR().post(API + "/action", { action: "setlabel", target: key, text: nn }, function (x) {
+			var d = jparse(x);
+			busy(false);
+			if (d && d.ok) { toast("✔ " + String(d.msg || "备注已保存"), "good"); }
+			else { toast("✘ 备注没存上：" + ((d && d.msg) || ("HTTP " + ((x && x.status) || "?"))), "bad"); }
+			load();
+		});
+	}
+
 	/* ---------------- 事件（绑到 document，只绑一次） ---------------- */
 
 	if (!window.__af_bound) {
@@ -415,6 +492,17 @@
 		document.addEventListener("click", function (e) {
 			var t = e.target;
 			if (!t || !t.closest) { return; }
+
+			/* 🏷 = 写备注（只存路由器本地，不碰 dnsmasq） */
+			var bl = t.closest("[data-label]");
+			if (bl) {
+				e.preventDefault();
+				e.stopPropagation();
+				setLabel(bl.getAttribute("data-label"));
+				return;
+			}
+
+			/* ✎ = 改路由器侧设备名（这个会写进 dnsmasq，所以只能是字母数字_- ） */
 			var b = t.closest("[data-rename]");
 			if (!b) { return; }
 			e.preventDefault();
@@ -433,6 +521,22 @@
 			var side = item.getAttribute("data-side");
 			if (side === "free") { runSeq([ip], "block",   "封禁"); }
 			else                 { runSeq([ip], "unblock", "解禁"); }
+		});
+	}
+
+	/* 🔴🔴 这是「点一下闪一下、设备没进右边、多选只成功第一台」的根因，别再动它：
+	   本页是 LuCI 的 CBI 页面，我们的内容会被包进它自己的 <form> 里。
+	   HTML 里 <button> 不写 type 时默认是 **submit** —— 点在表单内就会提交表单
+	   → 整页重载 → 浏览器 abort 掉我们刚发出的 /action 请求。
+	   所以：① 所有按钮都显式写了 type="button"；② 这里再把 form 的 submit 掐死兜底。
+	   本页没有任何 CBI 字段需要保存（页脚的「保存/保存&应用」本来就对本页无效），
+	   禁掉不会影响别的功能。 */
+	var afForm = (el("af-root") && el("af-root").closest) ? el("af-root").closest("form") : null;
+	if (afForm) {
+		afForm.addEventListener("submit", function (e) {
+			e.preventDefault();
+			e.stopPropagation();
+			return false;
 		});
 	}
 

@@ -27,6 +27,7 @@ local fs   = require "nixio.fs"
 
 local FILTER  = "/usr/bin/adhfilter"
 local LEASES  = "/tmp/dhcp.leases"
+local LABELS  = "/etc/adhfilter.labels"   -- 备注（自定义标签）：独立小文件，不碰 uci / 不碰 dnsmasq
 local PIP     = "KidADH"      -- IP 锚段名前缀
 local PMAC    = "KidADHM"     -- MAC 锚段名前缀（比 PIP 长，判断时先判它）
 local HOSTPFX = "KidHost_"    -- 静态绑定段名前缀
@@ -71,6 +72,13 @@ end
 local function valid_name(nm)
 	if type(nm) ~= "string" or nm == "" or #nm > 20 then return false end
 	return nm:match("^[%w_%-]+$") ~= nil
+end
+
+-- 严格校验 MAC。备注（自定义标签）拿 MAC 当主键，所以 target 允许是 MAC 形式。
+-- 注意：MAC 里带冒号，**通不过 valid_name**（那个只放 [%w_%-]），必须单独认。
+local function valid_mac(m)
+	if type(m) ~= "string" then return false end
+	return m:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
 end
 
 -- 读 DHCP 租约：<过期时间> <MAC> <IP> <主机名> <clientid>
@@ -136,6 +144,24 @@ local function load_uci()
 	return binds, aip, amac, c
 end
 
+-- 读「备注」（自定义标签）：一行一条 `<key>\t<文本>`，key 是 MAC(小写,优先) 或 IP。
+-- **主键用 MAC** —— 设备换 IP 备注也不会丢。
+--
+-- 为什么不用 uci、也不写进 dnsmasq：备注是自由文本（要支持中文），而 dhcp-host 的
+-- name 只允许 [A-Za-z0-9_-]，写别的会让 dnsmasq 崩溃循环 → **全屋断网**。
+-- 放成一个独立小文件：既不碰 uci，也全程不经过 shell（没有命令注入的余地）。
+local function read_labels()
+	local t = {}
+	local f = io.open(LABELS, "r")
+	if not f then return t end
+	for line in f:lines() do
+		local k, v = line:match("^(%S+)\t(.+)$")
+		if k and v then t[k:lower()] = v end
+	end
+	f:close()
+	return t
+end
+
 local function adh_running()
 	local p = exec("pgrep -f AdGuardHome 2>/dev/null | head -1")
 	return p:match("%d+") ~= nil
@@ -186,9 +212,12 @@ function api_devices()
 	local neigh = read_neigh(landev)
 
 	local devs, seen = {}, {}
+	local labels = read_labels()
 
 	local function mk(ip, mac, name, bindname, bound)
 		local b = binds[ip]
+		-- 备注主键：优先 MAC（设备换 IP 备注也不丢），没拿到 MAC 才退化成 IP
+		local key = ((mac or "") ~= "") and mac:lower() or ip
 		return {
 			ip       = ip,
 			mac      = mac or "",
@@ -198,6 +227,8 @@ function api_devices()
 			filtered = (aip[ip] ~= nil) or ((mac or "") ~= "" and amac[mac] ~= nil),
 			online   = neigh[ip] ~= nil and neigh[ip].state ~= "FAILED",
 			randmac  = is_random_mac(mac),
+			key      = key,                              -- 前端拿它当备注的读写主键
+			label    = labels[key] or labels[ip] or "",  -- 你自己写的备注（空串=没写）
 		}
 	end
 
@@ -274,6 +305,7 @@ end
 local ACTIONS = {
 	bind = true, add = true, del = true, resync = true, rename = true,
 	block = true, unblock = true,
+	setlabel = true,   -- 备注（只写本地文件，不动网络配置）
 }
 
 -- POST /action  { action, target, newname }  → { ok, msg }
@@ -288,8 +320,42 @@ function api_action()
 		http.write_json({ ok = false, msg = "未知操作: " .. act })
 		return
 	end
-	if not (valid_ip(target) or valid_name(target)) then
-		http.write_json({ ok = false, msg = "目标不合法：只接受 IP 地址或 字母/数字/下划线/连字符 组成的名字" })
+	if not (valid_ip(target) or valid_name(target) or valid_mac(target)) then
+		http.write_json({ ok = false, msg = "目标不合法：只接受 IP 地址、MAC 或 字母/数字/下划线/连字符 组成的名字" })
+		return
+	end
+
+	-- ---------- 备注（自定义标签）----------
+	-- 只读写 /etc/adhfilter.labels，**不碰 dnsmasq、不碰防火墙** → 瞬间生效、不重启任何服务。
+	-- 整条路径都在 Lua 里完成、全程不经过 shell，所以备注里写什么都不会有注入风险。
+	-- 设备自报的名字（手机里的「名称」）孩子随手能改；这条备注只有你写得了，用来认人最稳。
+	if act == "setlabel" then
+		local key  = target:lower()
+		local text = http.formvalue("text") or ""
+		-- 把换行/制表符一并压成空格：它们是这个文件的字段分隔符，混进值里会破坏格式
+		text = text:gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")
+		if #text > 96 then   -- 32 个汉字 = 96 字节（前端也按 32 个字符卡了同一道）
+			http.write_json({ ok = false, msg = "备注太长（最多 32 个字符）" })
+			return
+		end
+		local t = read_labels()
+		if text == "" then t[key] = nil else t[key] = text end
+		local f = io.open(LABELS, "w")
+		if not f then
+			http.write_json({ ok = false, msg = "写不进 " .. LABELS .. "（空间或权限问题）" })
+			return
+		end
+		local n = 0
+		for k, v in pairs(t) do
+			f:write(k, "\t", v, "\n")
+			n = n + 1
+		end
+		f:close()
+		http.write_json({
+			ok  = true,
+			msg = ((text == "" and "备注已清除" or ("备注已设为「" .. text .. "」"))
+				.. "，共 " .. n .. " 台有备注"),
+		})
 		return
 	end
 
