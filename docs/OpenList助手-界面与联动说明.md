@@ -107,7 +107,8 @@
 #   data.db     —— SQLite，存储 / 用户 / 设置都在里面
 #
 # 设置表 x_setting_items 里有一项 key=token，值形如：
-#   openlist-7580aa70-....<64 位 base64>...
+#   openlist-<uuid>-....<64 位 base64>...
+#   ★ 这是**等同管理员**的凭据，别贴到任何地方（含本仓库、聊天、截图）
 # 它能直接当 Authorization 头用，权限等同管理员。
 strings -n 2 /root/openlist_run/data/data.db \
   | grep -o 'tokenopenlist-[^ ]*string' | head -1 \
