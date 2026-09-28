@@ -9,8 +9,16 @@ set "PAGER=cat"
 
 rem ============================================================
 rem  AX6600-Trucy  一键推送（Windows）
+rem
+rem  ⚠️ 与 push.command 对齐：走 SSH，不用 PAT。
+rem     Windows 那边需要自己一把钥匙：
+rem       1) ssh-keygen -t ed25519 -C "gnrsbassoutlook@users.noreply.github.com"
+rem       2) 把 %USERPROFILE%\.ssh\id_ed25519.pub 的内容粘到
+rem          https://github.com/settings/ssh/new
+rem       3) ssh -T git@github.com 出现 "successfully authenticated" 即通
+rem          （注意：ssh -T 成功时退出码也是 1，判断看输出，别看退出码）
 rem  ============================================================
-set "REPO_HTTPS=https://github.com/gnrsbassoutlook/AX6600-Trucy.git"
+set "REPO_SSH=git@github.com:gnrsbassoutlook/AX6600-Trucy.git"
 set "BRANCH=main"
 
 echo ==========================================
@@ -35,11 +43,11 @@ if not exist ".git" (
 
 for /f "delims=" %%a in ('git remote get-url origin 2^>nul') do set "CUR=%%a"
 if "!CUR!"=="" (
-    echo [1/6] 添加远端 -^> %REPO_HTTPS%
-    git remote add origin %REPO_HTTPS%
-) else if not "!CUR!"=="%REPO_HTTPS%" (
-    echo [1/6] 远端地址已更新 -^> %REPO_HTTPS%
-    git remote set-url origin %REPO_HTTPS%
+    echo [1/6] 添加远端 -^> %REPO_SSH%
+    git remote add origin %REPO_SSH%
+) else if not "!CUR!"=="%REPO_SSH%" (
+    echo [1/6] 远端地址已更新 -^> %REPO_SSH%
+    git remote set-url origin %REPO_SSH%
 )
 
 rem ---------- 2. 身份（只写本仓库，不动全局配置） ----------

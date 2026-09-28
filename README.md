@@ -219,12 +219,27 @@ OpenAppFilter 7.0 在 LuCI 上「页面能开、数据全空」的修复补丁�
 ## 怎么推这个仓库
 
 双击 `push.command`（macOS）或 `push.bat`（Windows）就行，会提示你填 commit 说明。
+已经推过的提交、已经存在的东西，重跑不会白做。
 
-首次推送会弹窗问 GitHub 账号 —— **用户名填 `gnrsbassoutlook`，
-密码栏粘贴 Personal Access Token**（不是登录密码，GitHub 早就不收密码了）。
-token 会被存进 macOS 钥匙串 / Windows 凭据管理器，以后不再问。
+认证走 **SSH key**，不用 Personal Access Token、不会过期。首次配置：
 
-脚本用 `https://` 而不是 `git@` —— 因为这台机器上没配 SSH key。
+```sh
+ssh-keygen -t ed25519 -C "gnrsbassoutlook@users.noreply.github.com"
+pbcopy < ~/.ssh/id_ed25519.pub        # macOS
+# Windows: type %USERPROFILE%\.ssh\id_ed25519.pub
+ssh -T git@github.com                 # 出现 "successfully authenticated" 就通了
+```
+
+公钥粘到 <https://github.com/settings/ssh/new>。
+**没配好时脚本会自己检测出来**，把公钥复制进剪贴板并打开这个页面。
+
+两个坑写在这里省得下次再踩：
+
+- ⚠️ `ssh -T git@github.com` **成功时退出码也是 1**（GitHub 不提供 shell 访问，
+  故意返回非 0）→ 只能看输出里有没有 `successfully authenticated`，**不能判退出码**。
+- ⚠️ 公开仓库的 `git ls-remote` **不带凭据也返回 0** → 拿它当"有没有身份"的探针
+  永远报成功。要验身份就得用写操作（`git push --dry-run`）。
+- ⚠️ 若 22 端口被网络封掉，`~/.ssh/config` 里备好了走 443 的配置（取消注释即可）。
 
 ---
 
