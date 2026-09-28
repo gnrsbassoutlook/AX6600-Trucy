@@ -1,0 +1,14 @@
+config openlist-assist 'main'
+	option enabled '1'
+	# 挂载点基目录：分区 sda2 会挂到 <mntbase>/sda2
+	option mntbase '/mnt'
+	# 卸载前是否自动停掉 OpenList（它占着盘上的文件，不停就卸不掉）。
+	# 界面上「这块盘正被 OpenList 用着」时也会自动带上这个行为。
+	option stop_openlist_on_umount '1'
+	# 内置 eMMC 里允许操作的分区（空格分隔）。
+	# 默认只放行那个 109GiB 的空白数据分区。
+	# ★ 绝不要加 mmcblk0 / mmcblk0p18 / mmcblk0p22 / mmcblk0p26：
+	#   它们分别是整颗 eMMC、rootfs、rootfs_data、swap —— 动了就是变砖。
+	option internal_devs 'mmcblk0p27'
+	# 内置分区固定的挂载点
+	option internal_mount '/mnt/emmc'

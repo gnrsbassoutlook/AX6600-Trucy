@@ -1,0 +1,1144 @@
+#!/bin/sh
+# ============================================================================
+#  diskctl — 硬盘管家（luci-app-openlist-assist 的后端）
+#
+#  给「OpenList 助手」页面提供全部实际操作能力；也可以直接在 SSH 里敲：
+#      diskctl status          看一眼所有 USB 盘
+#      diskctl mount sda2      挂载
+#      diskctl umount sda2     卸载
+#      diskctl clean sda2      清 NTFS 脏标记
+#
+#  ★ 四条必须守住的规矩
+#   1) 一律用 `busybox mount` / `busybox umount`。
+#      本固件装了 mount-utils(util-linux)，它的 /usr/bin/mount 与固件里的
+#      libmount.so.1 ABI 不匹配，裸敲会报
+#      `mnt_context_enable_onlyonce: symbol not found` —— 而 /usr/bin 在 PATH 里
+#      排在 /bin 前面，所以裸敲一定命中坏的那个。
+#   2) 挂载参数按 blkid 探到的文件系统类型分支：ntfs3 / exfat / vfat 各一套。
+#      内核里 ntfs3 与 exfat 都是内置模块（kmod-fs-ntfs3 / kmod-fs-exfat），
+#      **不需要额外装包就能挂载** —— 缺的只是 mkfs/fsck 这类工具。
+#   3) 判「脏盘」不靠解析 NTFS 字节（太脆），靠行为：
+#      ntfs3 遇到 VOLUME_IS_DIRTY 且没给 force 时会直接拒绝挂载并打印
+#      `Volume is dirty and "force" flag is not set`。所以
+#      「能不能不加 force 挂上」就是最可靠的判据。
+#   4) 破坏性动作（format）必须显式 --yes；并且拒绝碰系统盘、拒绝碰已挂载盘。
+#   5) 内置 eMMC 只放行白名单里的**具体分区**（默认 mmcblk0p27，109GiB 空 ext4）。
+#      绝不放开 mmcblk* 通配：mmcblk0p18 是 rootfs、p22 是 rootfs_data、
+#      p26 是 swap，误伤一个就变砖。
+#   6) eject 必须先确认是 USB 设备。少了这道闸门，
+#      `diskctl eject mmcblk0p27` 会顺着 parent 摸到 mmcblk0 并往
+#      /sys/block/mmcblk0/device/delete 写 1 —— 那是把系统盘拔了。
+#   7) 「全部挂载 / 全部卸载」只针对 USB 盘；内置盘归「内置存储」面板单独管。
+#
+#  ⚠️ 写这个脚本时踩过一次的坑：**中文全角标点紧跟变量名**会被 ash 当成变量名
+#     的一部分 → `unbound variable`，报错里变量名还是乱码，极难定位。
+#     所以凡是给用户看的文案里带变量的，一律写 `${VAR}`。
+# ============================================================================
+
+MNTBASE=/mnt
+LOG=/tmp/diskctl.log
+KLOG=/tmp/diskctl.kernel.log
+DEVFILE=/tmp/.diskctl.devs
+CONF=/etc/config/openlist-assist
+
+# OpenList 的安装位置与数据目录（读它的存储列表要用）
+OL_DIR=/root/openlist_run
+OL_DB="${OL_DIR}/data/data.db"
+OL_API=http://127.0.0.1:5244
+
+# ---- 内置 eMMC 数据分区的白名单 ------------------------------------------
+# 本机 eMMC（SanDisk SLD128，115GiB）里有一个 109GiB 的 ext4 分区
+# /dev/mmcblk0p27，出厂就是空的，谁也没用它 —— 正好当「内置临时存储」。
+# ★ 白名单必须精确到分区，绝不能放开 mmcblk* 通配：
+#   mmcblk0p18 是 rootfs、p22 是 rootfs_data、p26 是 swap，动了直接变砖。
+# 想加别的内置分区：uci add_list openlist-assist.main.internal_devs=xxx
+INTERNAL_DEVS="$(uci -q get ${CONF}.main.internal_devs 2>/dev/null | tr '\n' ' ')"
+[ -n "${INTERNAL_DEVS}" ] || INTERNAL_DEVS="mmcblk0p27"
+INTERNAL_MNT="$(uci -q get ${CONF}.main.internal_mount 2>/dev/null)"
+[ -n "${INTERNAL_MNT}" ] || INTERNAL_MNT="/mnt/emmc"
+
+# ---------------------------------------------------------------- 输出小工具
+
+say() {
+	printf '%s\n' "$*"
+	printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >> "${LOG}" 2>/dev/null
+}
+
+hr() {
+	printf '%s\n' "------------------------------------------------------------"
+}
+
+# 512 字节扇区数 -> 人类可读
+human() {
+	awk -v b="$1" 'BEGIN{
+		u[1]="B"; u[2]="K"; u[3]="M"; u[4]="G"; u[5]="T"; u[6]="P";
+		i=1;
+		while (b >= 1024 && i < 6) { b = b / 1024; i++ }
+		if (i == 1) printf "%.0f%s", b, u[i]; else printf "%.1f%s", b, u[i];
+	}'
+}
+
+# 该设备当前挂在哪（空 = 没挂）
+mnt_of() {
+	awk -v d="$1" '$1 == d { print $2; exit }' /proc/mounts
+}
+
+# 从 blkid 取一个字段（TYPE / LABEL / UUID / PARTLABEL）
+blkval() {
+	blkid -o value -s "$2" "$1" 2>/dev/null | head -1
+}
+
+# 是不是分区（区别于整盘）
+is_part() {
+	[ -e "/sys/class/block/$1/partition" ]
+}
+
+# 归属的整盘名：sda2 -> sda；sda -> sda；mmcblk0p27 -> mmcblk0
+# ★ 不能只用 `sed 's/[0-9]\+$//'`：那对 sda2 是对的，但 mmcblk0p27 会算出
+#   "mmcblk0p"（把 p 后面的 27 去掉，却留着 p）。必须从 sysfs 的目录结构取。
+parent_of() {
+	if is_part "$1"; then
+		p="$(basename "$(dirname "$(readlink -f "/sys/class/block/$1" 2>/dev/null)")" 2>/dev/null)"
+		if [ -n "${p}" ] && [ -e "/sys/class/block/${p}" ]; then
+			printf '%s\n' "${p}"
+		else
+			printf '%s\n' "$1" | sed 's/[0-9]\+$//'
+		fi
+	else
+		printf '%s\n' "$1"
+	fi
+}
+
+# 是不是 USB 设备（排除内置 eMMC / mmcblk）
+is_usb() {
+	case "$1" in
+		mmcblk*|loop*|ram*) return 1 ;;
+	esac
+	case "$(readlink -f "/sys/class/block/$1" 2>/dev/null)" in
+		*/usb*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# 是不是白名单里的内置分区
+is_internal() {
+	case " ${INTERNAL_DEVS} " in
+		*" $1 "*) return 0 ;;
+	esac
+	return 1
+}
+
+# 允许操作的全部设备 = USB 盘 ∪ 内置白名单
+is_known() { is_usb "$1" || is_internal "$1"; }
+
+# 该设备的挂载点：内置盘用固定目录，USB 盘用 /mnt/<设备名>
+mnt_target() {
+	if is_internal "$1"; then
+		printf '%s' "${INTERNAL_MNT}"
+	else
+		printf '%s' "${MNTBASE}/$1"
+	fi
+}
+
+# 按文件系统类型给挂载参数
+fs_opts() {
+	case "$1" in
+		ntfs|ntfs3)      printf '%s' "iocharset=utf8" ;;
+		exfat)           printf '%s' "iocharset=utf8,umask=000" ;;
+		vfat|fat|msdos)  printf '%s' "iocharset=utf8,utf8=1,umask=000" ;;
+		*)               printf '%s' "" ;;
+	esac
+}
+
+# 按文件系统类型给 -t 参数（blkid 报 "ntfs"，要挂成 "ntfs3"）
+fs_driver() {
+	case "$1" in
+		ntfs)            printf '%s' "ntfs3" ;;
+		vfat|fat|msdos)  printf '%s' "vfat" ;;
+		"")              printf '%s' "" ;;
+		*)               printf '%s' "$1" ;;
+	esac
+}
+
+# ntfs3 专属的错误判据
+is_dirty_err() {
+	printf '%s' "$1" | grep -qi "dirty"
+}
+
+# 抓内核里跟这块盘有关的话（ntfs3 认盘失败的原因都在里面）
+dump_kmsg() {
+	dmesg 2>/dev/null | grep -iE "ntfs3|exfat|usb-storage|uas|sda|sdb|sdc" | tail -12
+}
+
+# ---------------------------------------------------------------- 设备枚举
+
+# 列出所有可操作的盘/分区，每行：
+#   name|kind|parent|size_sectors|fstype|label|uuid|mnt|model
+#   kind: disk / part = USB 整盘 / USB 分区
+#         internal / ipart = 内置白名单整盘 / 分区
+enum_devs() {
+	for blk in /sys/class/block/*; do
+		[ -e "${blk}" ] || continue
+		nm="${blk##*/}"
+		if is_usb "${nm}"; then
+			if is_part "${nm}"; then kind=part; else kind=disk; fi
+		elif is_internal "${nm}"; then
+			if is_part "${nm}"; then kind=ipart; else kind=internal; fi
+		else
+			continue
+		fi
+
+		par="$(parent_of "${nm}")"
+		sec="$(cat "/sys/class/block/${nm}/size" 2>/dev/null)"
+		[ -n "${sec}" ] || sec=0
+
+		# 文件系统类型：**整盘也要查** —— 有些盘没有分区表，直接在整盘上
+		# 建了文件系统（小 U 盘常见，Windows 也能这么格）。那种盘也得能挂，
+		# 否则"全部挂载"会把它整个跳过。
+		# 注意：有分区表的整盘，`blkid -s TYPE` 返回空（它只有 PTTYPE），
+		# 所以不会出现"整盘和它的分区都被当成可挂载"的重复。
+		type="$(blkval "/dev/${nm}" TYPE)"
+
+		if [ "${kind}" = "disk" ] || [ "${kind}" = "internal" ]; then
+			lbl=""
+			uid=""
+			mdl="$(cat "/sys/class/block/${nm}/device/model" 2>/dev/null | tr -d '\n')"
+			vnd="$(cat "/sys/class/block/${nm}/device/vendor" 2>/dev/null | tr -d '\n')"
+			# eMMC 没有 model/vendor，只有 name（例如 SLD128）
+			if [ -z "${mdl}" ]; then
+				mdl="$(cat "/sys/class/block/${nm}/device/name" 2>/dev/null | tr -d '\n')"
+				vnd=""
+			fi
+			[ -n "${vnd}" ] && mdl="${vnd} ${mdl}"
+		else
+			lbl="$(blkval "/dev/${nm}" LABEL)"
+			uid="$(blkval "/dev/${nm}" UUID)"
+			if [ "${kind}" = "ipart" ]; then
+				mdl="$(cat "/sys/class/block/${par}/device/name" 2>/dev/null | tr -d '\n')"
+			else
+				mdl=""
+			fi
+		fi
+
+		mnt="$(mnt_of "/dev/${nm}")"
+		printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+			"${nm}" "${kind}" "${par}" "${sec}" "${type}" "${lbl}" "${uid}" "${mnt}" "${mdl}"
+	done | awk -F'|' '{
+		# 整盘排在同盘的分区前面，前端才能按「整盘 → 分区」开卡片。
+		# 不能直接 `sort`：行首是设备名，而 "sda|" 的 `|`(0x7C) 大于 "sda1" 的
+		# `1`(0x31)，排出来整盘会跑到自己分区后面。
+		print (($2 == "disk" || $2 == "internal") ? "0" : "1") "|" $0
+	}' | sort | sed 's/^[01]|//'
+}
+
+# ★ 枚举结果一律先落到临时文件，再 `while read` 逐行读。
+#   绝不能用 `for x in $(enum_devs)` —— 那会按空格拆行，而整盘的型号里
+#   带空格（"ATA ST4000VX005-2LY1"），一拆开后面字段全部错位，
+#   轻则列表串行、重则 $((sec * 512)) 直接报 arithmetic syntax error。
+#   用 `done < 文件`（重定向）而不是 `| while`：重定向不会开子 shell，
+#   循环里对 n/bad 这类计数变量的修改才能带出来。
+enum_to_file() {
+	enum_devs > "${DEVFILE}" 2>/dev/null
+}
+
+jesc() {
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/ /g' | tr -d '\r\n'
+}
+
+has_bin() { command -v "$1" >/dev/null 2>&1 && printf 'true' || printf 'false'; }
+
+# FAT 工具的真实名字：OpenWrt 的 dosfstools 装出来叫 /usr/sbin/mkfs.fat 与
+# fsck.fat；别的发行版才叫 mkfs.vfat / fsck.vfat。两边都认。
+# $1 = mkfs | fsck
+which_fat() {
+	if command -v "$1.vfat" >/dev/null 2>&1; then
+		printf '%s.vfat' "$1"
+	elif command -v "$1.fat" >/dev/null 2>&1; then
+		printf '%s.fat' "$1"
+	fi
+}
+
+# ---------------------------------------------------------------- 动作：挂载
+
+do_mount_one() {
+	dev="$1"        # sda2
+	force="$2"      # 1 = 强力
+	rod="$3"        # 1 = 只读
+
+	full="/dev/${dev}"
+	if [ ! -b "${full}" ]; then
+		say "❌ ${full} 不存在（盘是不是被拔了？）"
+		return 1
+	fi
+
+	# 只处理 USB 盘 + 内置白名单。挡住 mmcblk0p18/p22/p26 这类系统分区 ——
+	# 挂载本身不一定会出事，但没有理由让它们进来。
+	if ! is_known "${dev}"; then
+		say "❌ ${dev} 不在可操作范围内（只处理 USB 盘和内置白名单分区）"
+		return 1
+	fi
+
+	mnt="$(mnt_of "${full}")"
+	if [ -n "${mnt}" ]; then
+		say "ℹ️  ${full} 已经挂在 ${mnt}，无需重复挂载"
+		return 0
+	fi
+
+	fstype="$(blkval "${full}" TYPE)"
+	if [ -z "${fstype}" ]; then
+		say "❌ ${full} 上没有识别到文件系统（未格式化，或 Windows 的保留分区）"
+		say "   这种分区本来就是挂不上的，属正常，不用管它。"
+		return 1
+	fi
+
+	drv="$(fs_driver "${fstype}")"
+	opts="$(fs_opts "${fstype}")"
+	[ -n "${opts}" ] || opts="defaults"
+	[ "${rod}" = "1" ] && opts="${opts},ro"
+
+	tgt="$(mnt_target "${dev}")"
+	mkdir -p "${tgt}" 2>/dev/null || { say "❌ 建不了挂载点 ${tgt}"; return 1; }
+
+	hr
+	say "▶ 挂载 ${full}  [${fstype}]  → ${tgt}"
+	say "   busybox mount -t ${drv} -o ${opts} ${full} ${tgt}"
+
+	out="$(busybox mount -t "${drv}" -o "${opts}" "${full}" "${tgt}" 2>&1)"
+	rc=$?
+	[ -n "${out}" ] && say "   ${out}"
+
+	# 干净挂失败 → 若允许，加 force 再来一次
+	if [ ${rc} -ne 0 ] && [ "${force}" = "1" ]; then
+		if is_dirty_err "${out}"; then
+			say "⚠️  内核说这颗盘「脏」了（没给 force 就不让挂）"
+		else
+			say "⚠️  普通挂载没成功，改用强力挂载再试一次…"
+		fi
+		out2="$(busybox mount -t "${drv}" -o "force,${opts}" "${full}" "${tgt}" 2>&1)"
+		rc=$?
+		[ -n "${out2}" ] && say "   ${out2}"
+		if [ ${rc} -eq 0 ]; then
+			say "✅ 强力挂载成功"
+			say "   （说明这颗盘确实带脏标记，本次挂载已让内核重放日志；"
+			say "     建议找机会在 Windows 上对 ${dev} 跑一次 chkdsk /f 彻底修干净）"
+		fi
+	fi
+
+	if [ ${rc} -eq 0 ]; then
+		say "✅ ${full} 挂载成功 → ${tgt}"
+		df -h "${tgt}" 2>/dev/null | tail -1 | awk '{printf "   容量 %s ／ 已用 %s ／ 可用 %s（%s）\n", $2, $3, $4, $5}'
+		say "   OpenList 里点「刷新」就能看到；如果存储已指向这里，直接可用。"
+		return 0
+	fi
+
+	rmdir "${tgt}" 2>/dev/null
+	say "❌ ${full} 挂载失败（退出码 ${rc}）"
+	say "   最近的内核消息："
+	dump_kmsg | while IFS= read -r L; do say "     ${L}"; done
+	return 1
+}
+
+do_mount() {
+	dev="$1"
+	if [ "${dev}" = "all" ]; then
+		n=0; bad=0
+		enum_to_file
+		while IFS= read -r line; do
+			nm="${line%%|*}"
+			k="${line#*|}"; k="${k%%|*}"
+			# 「全部挂载」只管 USB 盘。内置 eMMC 归「内置存储」面板单独管，
+			# 免得顺手把系统盘也挂上（挂载本身无害，但语义要干净）。
+			if [ "${k}" = "internal" ] || [ "${k}" = "ipart" ]; then
+				continue
+			fi
+			# 只挂「有文件系统」的：分区，或者没有分区表、直接在整盘上
+			# 建了文件系统的盘。第 5 个字段就是文件系统类型。
+			rest="${line#*|}"; rest="${rest#*|}"; rest="${rest#*|}"; rest="${rest#*|}"
+			type="${rest%%|*}"
+			[ -n "${type}" ] || continue
+			do_mount_one "${nm}" "${OPT_FORCE}" 0 && n=$((n + 1)) || bad=$((bad + 1))
+		done < "${DEVFILE}"
+		hr
+		say "【汇总】全部挂载结束：成功 ${n} 个，失败 ${bad} 个"
+		return 0
+	fi
+	do_mount_one "${dev}" "${OPT_FORCE}" "${OPT_RO}"
+}
+
+# ---------------------------------------------------------------- 动作：卸载
+
+# 启动 OpenList（幂等：已经在跑就什么都不做）
+ol_start() {
+	if pidof openlist >/dev/null 2>&1; then
+		return 0
+	fi
+	[ -x /root/openlist_run/openlist ] || return 1
+	cd /root/openlist_run || return 1
+	./openlist server > /tmp/openlist.log 2>&1 &
+	cd / >/dev/null 2>&1
+	sleep 3
+	pidof openlist >/dev/null 2>&1
+}
+
+# 卸载时如果临时停过 OpenList，卸完把它拉回来。
+# 不然"卸一块盘"会顺手把整个 NAS 停掉 —— 那是两件不同的事。
+ol_restart() {
+	say "▶ 重新拉起 OpenList（刚才为了卸载临时停的）…"
+	if ol_start; then
+		say "✅ OpenList 已恢复（pid $(pidof openlist)）"
+	else
+		say "⚠️  OpenList 没起来。到「OpenList 助手」页面点一下「启动 OpenList」，"
+		say "   或者 SSH 里跑 diskctl openlist start。"
+	fi
+}
+
+do_umount_one() {
+	dev="$1"
+	force="$2"      # 1 = 强力（lazy）
+	stop="$3"       # 1 = 先停 OpenList
+
+	full="/dev/${dev}"
+	mnt="$(mnt_of "${full}")"
+	if [ -z "${mnt}" ]; then
+		say "ℹ️  ${full} 当前没有挂载"
+		return 0
+	fi
+
+	# 只卸「归本工具管」的东西：USB 盘、内置白名单，或者挂载点本来就在
+	# /mnt 树下。这条专门挡住 `diskctl umount mmcblk0p18` 这种去卸 /rom 的
+	# 手滑操作 —— 那会把 overlay 的地基拆了。
+	if ! is_known "${dev}"; then
+		case "${mnt}" in
+			"${MNTBASE}"/*) : ;;
+			*)
+				say "❌ ${full} 挂在 ${mnt}，不属于本工具管辖，拒绝卸载"
+				return 1
+				;;
+		esac
+	fi
+
+	hr
+	# 临时停 OpenList（它占着盘上的文件，不停就卸不掉）。
+	# 记住它原本在不在跑 —— 卸完要还回去。
+	local ol_was=0
+	if [ "${stop}" = "1" ]; then
+		if pidof openlist >/dev/null 2>&1; then
+			ol_was=1
+			say "▶ 先临时停掉 OpenList（它正占着盘上的文件，不停卸不掉）…"
+			killall openlist 2>/dev/null
+			sleep 2
+			say "   已停（卸载完成后会自动拉起来）"
+		else
+			say "ℹ️  OpenList 本来就没在跑"
+		fi
+	fi
+
+	say "▶ 卸载 ${mnt}"
+	out="$(busybox umount "${mnt}" 2>&1)"
+	rc=$?
+	[ -n "${out}" ] && say "   ${out}"
+
+	if [ ${rc} -ne 0 ] && [ "${force}" = "1" ]; then
+		say "⚠️  正常卸载失败（还有进程占着），改用「强力卸载」"
+		say "   （lazy 方式：先把挂载点从目录树上摘掉，等占用者松手再真正释放）"
+		out="$(busybox umount -l "${mnt}" 2>&1)"
+		rc=$?
+		[ -n "${out}" ] && say "   ${out}"
+	fi
+
+	sleep 1
+	if [ -z "$(mnt_of "${full}")" ]; then
+		say "✅ 已卸载 —— 现在可以安全拔线，或直接点「安全弹出」"
+		[ "${ol_was}" = "1" ] && ol_restart
+		return 0
+	fi
+
+	say "❌ 还是被占用，没能卸掉"
+	say "   常见元凶：OpenList 正在读写、Kodi/播放器还连着 WebDAV、SSH 里还 cd 在那个目录。"
+	say "   办法：改用「强力卸载」—— 它会临时停掉 OpenList，卸完自动帮你拉回来。"
+	[ "${ol_was}" = "1" ] && ol_restart
+	return 1
+}
+
+do_umount() {
+	dev="$1"
+	if [ "${dev}" = "all" ]; then
+		n=0
+		enum_to_file
+		while IFS= read -r line; do
+			nm="${line%%|*}"
+			k="${line#*|}"; k="${k%%|*}"
+			if [ "${k}" = "internal" ] || [ "${k}" = "ipart" ]; then
+				continue		# 同 do_mount all：内置盘不参与"全部卸载"
+			fi
+			# 不按"是不是分区"过滤：只要这个设备真的挂着就卸
+			[ -n "$(mnt_of "/dev/${nm}")" ] || continue
+			do_umount_one "${nm}" "${OPT_FORCE}" "${OPT_STOP}" && n=$((n + 1))
+		done < "${DEVFILE}"
+		hr
+		say "【汇总】全部卸载结束：卸掉 ${n} 个"
+		return 0
+	fi
+	do_umount_one "${dev}" "${OPT_FORCE}" "${OPT_STOP}"
+}
+
+# ---------------------------------------------------------------- 动作：脏标记
+
+do_dirty() {
+	dev="$1"
+	full="/dev/${dev}"
+	[ -b "${full}" ] || { say "❌ ${full} 不存在"; return 1; }
+	if ! is_known "${dev}"; then
+		say "❌ ${dev} 不在可操作范围内"
+		return 1
+	fi
+
+	hr
+	say "【检查】${full} 的文件系统健康度（只读，不改动数据）"
+
+	mnt="$(mnt_of "${full}")"
+	if [ -n "${mnt}" ]; then
+		say "ℹ️  它当前挂在 ${mnt}，说明已经挂上了 —— 能挂上就说明日志没问题。"
+		say "   内核相关消息："
+		dump_kmsg | while IFS= read -r L; do say "     ${L}"; done
+		return 0
+	fi
+
+	fstype="$(blkval "${full}" TYPE)"
+	if [ -z "${fstype}" ]; then
+		say "❌ ${full} 上没有识别到文件系统，无从判断"
+		return 1
+	fi
+	if [ "${fstype}" != "ntfs" ]; then
+		say "ℹ️  这颗盘是 ${fstype}，没有 NTFS 那种「脏标记」机制"
+		if [ "${fstype}" = "exfat" ]; then
+			say "   exFAT 是无日志文件系统，断电后不靠脏标记，而是靠 fsck.exfat 扫一遍"
+			say "   （需要 exfatprogs 包，可在「工具」里装）"
+		fi
+		return 0
+	fi
+
+	drv="$(fs_driver "${fstype}")"
+	probe="/tmp/.diskprobe.$$"
+	mkdir -p "${probe}"
+
+	say "▶ 试着以只读方式挂一下（不加 force）…"
+	out="$(busybox mount -t "${drv}" -o "ro,iocharset=utf8" "${full}" "${probe}" 2>&1)"
+	rc=$?
+	[ -n "${out}" ] && say "   ${out}"
+
+	if [ ${rc} -eq 0 ]; then
+		busybox umount "${probe}" 2>/dev/null
+		rmdir "${probe}" 2>/dev/null
+		say "✅ 结论：文件系统正常 —— 不需要 force 就能挂上，没有脏标记。"
+		return 0
+	fi
+
+	rmdir "${probe}" 2>/dev/null
+	if is_dirty_err "${out}"; then
+		say "⚠️  结论：这颗盘带「脏标记」（上次没正常退出，或者断电/直接拔线了）。"
+		say "   两条路：①「强力挂载」= 让内核带 force 挂上并重放日志；"
+		say "           ②「清除脏标记」= 先修干净再挂，之后就不用每次都 force。"
+		return 2
+	fi
+
+	say "❌ 结论：挂不上，但不是脏标记的锅（可能是分区表/文件系统损坏）"
+	say "   最近的内核消息："
+	dump_kmsg | while IFS= read -r L; do say "     ${L}"; done
+	return 1
+}
+
+# 真正去清脏标记
+do_clean() {
+	dev="$1"
+	full="/dev/${dev}"
+	[ -b "${full}" ] || { say "❌ ${full} 不存在"; return 1; }
+	if ! is_known "${dev}"; then
+		say "❌ ${dev} 不在可操作范围内"
+		return 1
+	fi
+
+	hr
+	say "【清理】清除 ${full} 的脏标记"
+
+	# 1) 必须先卸载
+	mnt="$(mnt_of "${full}")"
+	if [ -n "${mnt}" ]; then
+		say "▶ 它正挂在 ${mnt}，先卸下来"
+		do_umount_one "${dev}" 1 "${OPT_STOP}" || { say "❌ 卸不掉就没法清，先解决占用问题"; return 1; }
+	fi
+
+	fstype="$(blkval "${full}" TYPE)"
+	if [ "${fstype}" != "ntfs" ]; then
+		say "ℹ️  这颗盘是 ${fstype}，不是 NTFS，没有脏标记要清"
+		return 0
+	fi
+
+	# 2) 有 ntfsfix 就用它（最正统）
+	if command -v ntfsfix >/dev/null 2>&1; then
+		say "▶ 用 ntfsfix 修（这是 NTFS 官方工具，最干净的做法）"
+		out="$(ntfsfix -d "${full}" 2>&1)"
+		rc=$?
+		printf '%s\n' "${out}" | while IFS= read -r L; do say "   ${L}"; done
+		if [ ${rc} -eq 0 ]; then
+			say "✅ ntfsfix 执行完毕"
+		else
+			say "⚠️  ntfsfix 返回 ${rc}，继续用挂载法兜底"
+		fi
+	else
+		say "ℹ️  系统里没有 ntfsfix（装不上 ntfs-3g：固件没有 fuse），改用挂载法"
+	fi
+
+	# 3) 挂载法：带 force 挂一次再卸 —— ntfs3 挂载时会重放日志，卸载时会把脏标记清掉
+	say "▶ 带 force 挂载一次，让内核重放日志…"
+	tgt="$(mnt_target "${dev}")"
+	mkdir -p "${tgt}" 2>/dev/null
+	out="$(busybox mount -t ntfs3 -o "force,iocharset=utf8" "${full}" "${tgt}" 2>&1)"
+	rc=$?
+	[ -n "${out}" ] && say "   ${out}"
+	if [ ${rc} -ne 0 ]; then
+		rmdir "${tgt}" 2>/dev/null
+		say "❌ force 挂载也失败了 —— 这颗盘可能伤得比较重"
+		dump_kmsg | while IFS= read -r L; do say "     ${L}"; done
+		say "   建议接到 Windows 上跑 chkdsk /f 修一次。"
+		return 1
+	fi
+	say "   已挂上，正在卸载（这一步会把脏标记写干净）…"
+	sync
+	out="$(busybox umount "${tgt}" 2>&1)"
+	[ -n "${out}" ] && say "   ${out}"
+
+	# 4) 复核：现在应该能不加 force 挂上
+	say "▶ 复核：再试一次不带 force 的挂载…"
+	out="$(busybox mount -t ntfs3 -o "iocharset=utf8" "${full}" "${tgt}" 2>&1)"
+	rc=$?
+	[ -n "${out}" ] && say "   ${out}"
+	if [ ${rc} -eq 0 ]; then
+		busybox umount "${tgt}" 2>/dev/null
+		say "✅✅ 脏标记已清除 —— 现在不加 force 也能正常挂载了。"
+		return 0
+	fi
+	rmdir "${tgt}" 2>/dev/null
+	say "⚠️  还是需要 force。这不一定是坏事（有些盘的设计就是这样），"
+	say "   以后照常用「强力挂载」即可；实在想根治就接 Windows 跑 chkdsk /f。"
+	return 1
+}
+
+# ---------------------------------------------------------------- 动作：安全弹出
+
+do_eject() {
+	dev="$1"
+
+	# ★ 安全闸门：只允许弹出 USB 设备。
+	#   没有这道闸门，`diskctl eject mmcblk0p27` 会顺着 parent_of 找到 mmcblk0，
+	#   然后往 /sys/block/mmcblk0/device/delete 写 1 —— 那颗 eMMC 是系统盘，
+	#   一写入整个系统就没了。
+	if ! is_usb "${dev}"; then
+		say "❌ ${dev} 不是 USB 设备，不能弹出（保护内置存储）"
+		return 1
+	fi
+
+	# 传分区名也认，自动切到整盘
+	disk="$(parent_of "${dev}")"
+	[ -b "/dev/${disk}" ] || { say "❌ /dev/${disk} 不存在"; return 1; }
+
+	hr
+	say "【弹出】安全断开 /dev/${disk}"
+
+	# 1) 把它所有分区都卸掉（总是用强力，因为是"要拔了"的语义）
+	enum_to_file
+	while IFS= read -r line; do
+		nm="${line%%|*}"
+		[ "$(parent_of "${nm}")" = "${disk}" ] || continue
+		[ "${nm}" = "${disk}" ] && continue
+		[ -n "$(mnt_of "/dev/${nm}")" ] || continue
+		do_umount_one "${nm}" 1 "${OPT_STOP}"
+	done < "${DEVFILE}"
+
+	# 2) 刷缓存
+	say "▶ 同步缓存到盘上…"
+	sync
+	sleep 1
+
+	# 3) 通知 SCSI 层拔掉设备
+	if [ -e "/sys/block/${disk}/device/delete" ]; then
+		say "▶ 通知内核断开该设备…"
+		printf '1\n' > "/sys/block/${disk}/device/delete" 2>/dev/null
+		sleep 2
+		if [ -b "/dev/${disk}" ]; then
+			say "⚠️  设备节点还在，但缓存已刷完 —— 现在拔线是安全的。"
+		else
+			say "✅ 设备已断开，可以放心拔线了。"
+		fi
+		say "   注意：下次插回来，设备名可能变成 sdb / sdc（内核按插入顺序编号）。"
+		return 0
+	fi
+
+	say "⚠️  这块桥接芯片不支持软弹出。缓存已经刷完了，直接拔线是安全的。"
+	return 0
+}
+
+# ---------------------------------------------------------------- 动作：格式化
+
+do_format() {
+	dev="$1"
+	fs="$2"
+	full="/dev/${dev}"
+
+	[ -b "${full}" ] || { say "❌ ${full} 不存在"; return 1; }
+
+	# —— 安全闸门 1：必须是分区，且属于 USB 盘
+	if ! is_part "${dev}"; then
+		say "❌ 只允许格式化**分区**（例如 sda2），不允许直接格式化整盘 ${dev}"
+		return 1
+	fi
+	if ! is_usb "${dev}"; then
+		say "❌ ${dev} 不是 USB 设备，拒绝操作（保护系统盘）"
+		return 1
+	fi
+
+	# —— 安全闸门 2：不能是已挂载的
+	if [ -n "$(mnt_of "${full}")" ]; then
+		say "❌ ${full} 正挂载着，先卸载再来"
+		return 1
+	fi
+
+	# —— 安全闸门 3：必须显式 --yes
+	if [ "${OPT_YES}" != "1" ]; then
+		say "❌ 危险操作：格式化会清空 ${full} 上的**全部数据**。"
+		say "   确认无误请在命令后加 --yes。"
+		return 1
+	fi
+
+	case "${fs}" in
+		exfat) tool="mkfs.exfat"; fsname="exFAT" ;;
+		vfat)  tool="$(which_fat mkfs)"; fsname="FAT32" ;;
+		ext4)  tool="mkfs.ext4"; fsname="ext4" ;;
+		ntfs)  tool="mkntfs";   fsname="NTFS" ;;
+		*)     say "❌ 不支持的文件系统：${fs}（可选 exfat / vfat / ext4）"; return 1 ;;
+	esac
+
+	if [ -z "${tool}" ] || ! command -v "${tool}" >/dev/null 2>&1; then
+		say "❌ 缺少工具 ${tool:-mkfs.fat}，先到「工具」页点「一键安装」"
+		say "   （exFAT 要装 exfat-mkfs；FAT32 要装 dosfstools；这两个官方源里都有）"
+		return 1
+	fi
+
+	hr
+	say "⚠️  即将格式化 ${full} 为 ${fsname}，盘上数据将全部清空！"
+	say "▶ 执行 ${tool} ${full} …"
+
+	case "${fs}" in
+		exfat) out="$(${tool} "${full}" 2>&1)" ;;
+		vfat)  out="$(${tool} -F 32 "${full}" 2>&1)" ;;
+		ext4)  out="$(mkfs.ext4 -F "${full}" 2>&1)" ;;
+		ntfs)  out="$(mkntfs -f -F "${full}" 2>&1)" ;;
+	esac
+	rc=$?
+	printf '%s\n' "${out}" | tail -20 | while IFS= read -r L; do say "   ${L}"; done
+
+	if [ ${rc} -eq 0 ] && [ "$(blkval "${full}" TYPE)" = "${fs}" ]; then
+		say "✅ 格式化完成：${full} 现在是 ${fsname}"
+		say "   挂载参数会按新类型自动切换，直接点「挂载」即可。"
+		return 0
+	fi
+	say "❌ 格式化似乎没成功（退出码 ${rc}）"
+	return 1
+}
+
+# ---------------------------------------------------------------- 动作：OpenList
+
+do_openlist() {
+	case "$1" in
+		start)
+			if pidof openlist >/dev/null 2>&1; then
+				say "ℹ️  OpenList 已经在跑（pid $(pidof openlist)）"
+				return 0
+			fi
+			if [ ! -x /root/openlist_run/openlist ]; then
+				say "❌ 找不到 /root/openlist_run/openlist"
+				return 1
+			fi
+			say "▶ 启动 OpenList…"
+			if ol_start; then
+				say "✅ OpenList 已启动（pid $(pidof openlist)），面板 http://$(uci -q get network.lan.ipaddr || echo 192.168.1.1):5244"
+				return 0
+			fi
+			say "❌ OpenList 起不来，看 /tmp/openlist.log"
+			return 1
+			;;
+		stop)
+			if pidof openlist >/dev/null 2>&1; then
+				killall openlist 2>/dev/null
+				sleep 2
+				say "✅ OpenList 已停止"
+			else
+				say "ℹ️  OpenList 本来就没在跑"
+			fi
+			return 0
+			;;
+		*)
+			hr
+			say "OpenList 状态"
+			if pidof openlist >/dev/null 2>&1; then
+				say "  ✅ 正在运行，pid $(pidof openlist)"
+			else
+				say "  ⛔ 没有运行"
+			fi
+			say "  程序目录：/root/openlist_run"
+			say "  面板地址：http://$(uci -q get network.lan.ipaddr || echo 192.168.1.1):5244"
+			return 0
+			;;
+	esac
+}
+
+# ---------------------------------------------------------------- 工具自检
+
+do_tools() {
+	if [ "${OPT_INSTALL}" = "1" ]; then
+		hr
+		say "【安装】准备安装格式化 / 检查工具"
+		say "   将要安装：exfat-mkfs（mkfs.exfat）· exfat-fsck（fsck.exfat）"
+		say "             dosfstools（mkfs.fat + fsck.fat）"
+		say "             e2fsprogs（e2fsck）"
+		say "   注：官方源里没有 exfatprogs 这个总包，是拆成 exfat-mkfs / exfat-fsck 的。"
+		say "   这些都是纯用户态程序，不依赖内核模块，能装。"
+		hr
+		say "▶ opkg update …"
+		opkg update 2>&1 | tail -3 | while IFS= read -r L; do say "   ${L}"; done
+		say "▶ opkg install exfat-mkfs exfat-fsck dosfstools e2fsprogs …"
+		out="$(opkg install exfat-mkfs exfat-fsck dosfstools e2fsprogs 2>&1)"
+		printf '%s\n' "${out}" | tail -16 | while IFS= read -r L; do say "   ${L}"; done
+		hr
+	fi
+
+	hr
+	say "【工具】可用性检查"
+	printf '   %-16s %s\n' "ntfs3 驱动"    "$(grep -qw ntfs3 /proc/filesystems && echo '✅ 内置' || echo '❌ 缺失')" | while IFS= read -r L; do say "${L}"; done
+	printf '   %-16s %s\n' "exfat 驱动"    "$(grep -qw exfat /proc/filesystems && echo '✅ 内置' || echo '❌ 缺失')" | while IFS= read -r L; do say "${L}"; done
+	printf '   %-16s %s\n' "vfat 驱动"     "$(grep -qw vfat  /proc/filesystems && echo '✅ 内置' || echo '❌ 缺失')" | while IFS= read -r L; do say "${L}"; done
+	say ""
+	say "   挂载用得到的东西（★ 全是内核自带的，不用装）"
+	say "   格式化 / 检查用得到的工具（缺哪个就在下面）"
+	printf '   %-16s %s\n' "mkfs.exfat" "$(has_bin mkfs.exfat | sed 's/true/✅ 已装/;s/false/❌ 缺失（装 exfat-mkfs）/')" | while IFS= read -r L; do say "${L}"; done
+	printf '   %-16s %s\n' "fsck.exfat" "$(has_bin fsck.exfat | sed 's/true/✅ 已装/;s/false/❌ 缺失（装 exfat-fsck）/')" | while IFS= read -r L; do say "${L}"; done
+	printf '   %-16s %s\n' "mkfs.fat"  "$(has_bin "$(which_fat mkfs)" | sed 's/true/✅ 已装/;s/false/❌ 缺失（装 dosfstools）/')" | while IFS= read -r L; do say "${L}"; done
+	printf '   %-16s %s\n' "fsck.fat"  "$(has_bin "$(which_fat fsck)" | sed 's/true/✅ 已装/;s/false/❌ 缺失（装 dosfstools）/')" | while IFS= read -r L; do say "${L}"; done
+	printf '   %-16s %s\n' "mkfs.ext4"  "$(has_bin mkfs.ext4  | sed 's/true/✅ 已装/;s/false/❌ 缺失（装 e2fsprogs）/')" | while IFS= read -r L; do say "${L}"; done
+	printf '   %-16s %s\n' "ntfsfix"    "$(has_bin ntfsfix | sed 's/true/✅ 已装/;s/false/❌ 没有（本固件无 fuse，装不了 ntfs-3g）/')" | while IFS= read -r L; do say "${L}"; done
+	say ""
+	say "   ⚠️ NTFS 格式化在本固件上做不了（缺 mkntfs）。要 NTFS 请在 Windows 上格式化。"
+	say "      但 NTFS 的挂载与读写完全没问题（内核自带 ntfs3）。"
+	return 0
+}
+
+# ---------------------------------------------------------------- OpenList 存储
+
+# ★ 从这里拿 OpenList 的 API 凭据，**不需要口令、也不用装 sqlite3**：
+#   OpenList 把一枚长期有效的 token 存在 data.db 的 x_setting_items 表里
+#   （键名就叫 token，值形如 "openlist-<uuid><一串 base64>"）。它能直接当
+#   Authorization 头用，权限等同管理员。
+#   于是我们读 data.db 里那一段明文串就够了 —— 插件不必保存 OpenList 口令，
+#   也不必给路由器装任何新包。
+#   （试过用 config.json 里的 jwt_secret 自己签一个 JWT，会被
+#    "token is invalidated" 拒掉：OpenList 还会核对 token 里内嵌的口令哈希。）
+ol_token() {
+	[ -f "${OL_DB}" ] || return 1
+	strings -n 2 "${OL_DB}" 2>/dev/null \
+		| grep -o 'tokenopenlist-[^ ]*string' | head -1 \
+		| sed 's/^token//; s/string$//'
+}
+
+# 输出 OpenList 的存储列表：
+#   {"ok":true,"err":"","storage":[{"id":1,"mount_path":"/THW-4T",...}]}
+# ok=false 时 storage 恒为空数组，前端照常渲染，只是标记为"读不到"。
+ol_storages_json() {
+	tk="$(ol_token)"
+	if [ -z "${tk}" ]; then
+		printf '{"ok":false,"err":"读不到 OpenList 的 API 凭据（data.db 里没有 token 项）","storage":[]}'
+		return 0
+	fi
+	if ! pidof openlist >/dev/null 2>&1; then
+		printf '{"ok":false,"err":"OpenList 当前没有运行","storage":[]}'
+		return 0
+	fi
+
+	raw="$(curl -s -m 8 -H "Authorization: ${tk}" "${OL_API}/api/admin/storage/list" 2>/dev/null)"
+	if [ -z "${raw}" ]; then
+		printf '{"ok":false,"err":"调 OpenList 接口没有响应（5244 端口没通？）","storage":[]}'
+		return 0
+	fi
+
+	if command -v jq >/dev/null 2>&1; then
+		out="$(printf '%s' "${raw}" | jq -c '{
+			ok: (.code == 200),
+			err: (if (.code == 200) then "" else ((.message // "接口返回异常") | tostring) end),
+			storage: [ (.data.content // [])[] | {
+				id, mount_path, driver, status, disabled,
+				root: (try (((.addition // "{}") | fromjson).root_folder_path) catch "")
+			} ]
+		}' 2>/dev/null)"
+		if [ -n "${out}" ]; then
+			printf '%s' "${out}"
+			return 0
+		fi
+	fi
+
+	printf '{"ok":false,"err":"解析 OpenList 的返回失败（缺 jq？）","storage":[]}'
+}
+
+# ---------------------------------------------------------------- 列表 / JSON
+
+# 分区的展示状态（do_list / child_list / 独立分区段共用）
+dev_state() {   # $1=文件系统类型  $2=挂载点
+	if [ -n "$2" ]; then
+		printf '✅ 已挂载 → %s' "$2"
+	elif [ -z "$1" ]; then
+		printf '⛔ 无文件系统（挂不了，属正常）'
+	else
+		printf '⭕ 未挂载'
+	fi
+}
+
+# 某个整盘名在清单里吗（do_list 判断"孤立分区"用）
+parent_listed() {   # $1=整盘名
+	while IFS= read -r line; do
+		pnm="${line%%|*}"; prest="${line#*|}"
+		pkind="${prest%%|*}"
+		case "${pkind}" in
+			disk|internal) [ "${pnm}" = "$1" ] && return 0 ;;
+		esac
+	done < "${DEVFILE}"
+	return 1
+}
+
+# 打印「归属 $1 这块整盘」的所有分区
+child_list() {   # $1=整盘名
+	while IFS= read -r line; do
+		cnm="${line%%|*}";   crest="${line#*|}"
+		ckind="${crest%%|*}"; crest="${crest#*|}"
+		cpar="${crest%%|*}";  crest="${crest#*|}"
+		csec="${crest%%|*}";  crest="${crest#*|}"
+		ctype="${crest%%|*}"; crest="${crest#*|}"
+		clbl="${crest%%|*}";  crest="${crest#*|}"
+		cuid="${crest%%|*}";  crest="${crest#*|}"
+		cmnt="${crest%%|*}"
+
+		case "${ckind}" in disk|internal) continue ;; esac
+		[ "${cpar}" = "$1" ] || continue
+		say "   └ ${cnm}   $(human $((csec * 512)))   ${ctype:-?}   $(dev_state "${ctype}" "${cmnt}")"
+	done < "${DEVFILE}"
+}
+
+do_list() {
+	found=0
+	head1=0
+	enum_to_file
+
+	# ① 先打整盘头，紧跟它自己的分区。
+	#   ★ 这里必须真的按 `parent` 配对，不能"见到分区就往上一行底下缩进"：
+	#   内置白名单常常只放行 mmcblk0p27（而 mmcblk0 本身不放行），照老写法
+	#   它会被缩进到 /dev/sda 下面，看着像那块 4T 硬盘的分区 —— 会误导排查。
+	while IFS= read -r line; do
+		nm="${line%%|*}";   rest="${line#*|}"
+		kind="${rest%%|*}"; rest="${rest#*|}"
+		par="${rest%%|*}";  rest="${rest#*|}"
+		sec="${rest%%|*}";  rest="${rest#*|}"
+		type="${rest%%|*}"; rest="${rest#*|}"
+		lbl="${rest%%|*}";  rest="${rest#*|}"
+		uid="${rest%%|*}";  rest="${rest#*|}"
+		mnt="${rest%%|*}";  rest="${rest#*|}"
+		mdl="${rest%%|*}"
+
+		case "${kind}" in disk|internal) ;; *) continue ;; esac
+		# 标题按需打印：一块 USB 盘都没有时就整段不出现（副机常见）
+		if [ "${head1}" = "0" ]; then
+			hr
+			say "【硬盘】可操作的盘（USB 硬盘 + 内置白名单）"
+			hr
+			head1=1
+		fi
+		found=1
+		sz="$(human $((sec * 512)))"
+		tag="整盘"
+		[ "${kind}" = "internal" ] && tag="内置"
+		if [ -n "${type}" ]; then
+			say "▌/dev/${nm}   ${tag} ${sz}   ${type}   ${mdl}"
+		else
+			say "▌/dev/${nm}   ${tag} ${sz}   ${mdl}"
+		fi
+		child_list "${nm}"
+	done < "${DEVFILE}"
+
+	# ② 父盘不在清单里的分区单独列一段（典型：只放行了 mmcblk0p27）
+	orph=0
+	while IFS= read -r line; do
+		nm="${line%%|*}";   rest="${line#*|}"
+		kind="${rest%%|*}"; rest="${rest#*|}"
+		par="${rest%%|*}";  rest="${rest#*|}"
+		sec="${rest%%|*}";  rest="${rest#*|}"
+		type="${rest%%|*}"; rest="${rest#*|}"
+		lbl="${rest%%|*}";  rest="${rest#*|}"
+		uid="${rest%%|*}";  rest="${rest#*|}"
+		mnt="${rest%%|*}"
+
+		case "${kind}" in disk|internal) continue ;; esac
+		parent_listed "${par}" && continue
+		if [ "${orph}" = "0" ]; then
+			hr
+			say "【内置分区】所属整盘不在清单内，单独列出"
+			hr
+			orph=1
+		fi
+		found=1
+		say "▌/dev/${nm}   $(human $((sec * 512)))   ${type:-?}   $(dev_state "${type}" "${mnt}")   （属 /dev/${par}）"
+	done < "${DEVFILE}"
+
+	if [ "${found}" = "1" ]; then
+		hr
+	else
+		hr
+		say "   （一个盘都没插）"
+		hr
+	fi
+}
+
+do_json() {
+	printf '{"devs":['
+	first=1
+	enum_to_file
+	while IFS= read -r line; do
+		nm="${line%%|*}";      rest="${line#*|}"
+		kind="${rest%%|*}";    rest="${rest#*|}"
+		par="${rest%%|*}";     rest="${rest#*|}"
+		sec="${rest%%|*}";     rest="${rest#*|}"
+		type="${rest%%|*}";    rest="${rest#*|}"
+		lbl="${rest%%|*}";     rest="${rest#*|}"
+		uid="${rest%%|*}";     rest="${rest#*|}"
+		mnt="${rest%%|*}"
+		mdl="${rest#*|}"
+
+		# 已挂载的顺带把用量带上（前端画进度条）。df -k 输出：
+		#   Filesystem 1024-blocks Used Available Capacity Mounted on
+		ukb=0; tkb=0
+		if [ -n "${mnt}" ]; then
+			dfl="$(df -k "${mnt}" 2>/dev/null | tail -1)"
+			tkb="$(printf '%s' "${dfl}" | awk '{print $2}')"
+			ukb="$(printf '%s' "${dfl}" | awk '{print $3}')"
+			[ -n "${tkb}" ] || tkb=0
+			[ -n "${ukb}" ] || ukb=0
+		fi
+
+		[ "${first}" = "1" ] || printf ','
+		first=0
+		printf '{"name":"%s","kind":"%s","parent":"%s","bytes":%s,"size_h":"%s","fstype":"%s","label":"%s","uuid":"%s","mount":"%s","model":"%s","mounted":%s,"used_kb":%s,"total_kb":%s}' \
+			"$(jesc "${nm}")" "$(jesc "${kind}")" "$(jesc "${par}")" \
+			"$((sec * 512))" "$(human $((sec * 512)))" \
+			"$(jesc "${type}")" "$(jesc "${lbl}")" "$(jesc "${uid}")" \
+			"$(jesc "${mnt}")" "$(jesc "${mdl}")" \
+			"$([ -n "${mnt}" ] && echo true || echo false)" \
+			"${ukb}" "${tkb}"
+	done < "${DEVFILE}"
+	printf ']'
+
+	printf ',"tools":{"ntfs3":%s,"exfat":%s,"vfat":%s,"mkfs_exfat":%s,"mkfs_vfat":%s,"mkfs_ext4":%s,"mkfs_ntfs":%s,"ntfsfix":%s,"fsck_exfat":%s,"fsck_vfat":%s}' \
+		"$([ -n "$(grep -w ntfs3 /proc/filesystems)" ] && echo true || echo false)" \
+		"$([ -n "$(grep -w exfat /proc/filesystems)" ] && echo true || echo false)" \
+		"$([ -n "$(grep -w vfat  /proc/filesystems)" ] && echo true || echo false)" \
+		"$(has_bin mkfs.exfat)" \
+		"$([ -n "$(which_fat mkfs)" ] && echo true || echo false)" \
+		"$(has_bin mkfs.ext4)" \
+		"$(has_bin mkntfs)" "$(has_bin ntfsfix)" \
+		"$(has_bin fsck.exfat)" \
+		"$([ -n "$(which_fat fsck)" ] && echo true || echo false)"
+
+	if pidof openlist >/dev/null 2>&1; then
+		printf ',"openlist":{"running":true,"pid":"%s"}' "$(pidof openlist)"
+	else
+		printf ',"openlist":{"running":false,"pid":""}'
+	fi
+
+	printf ',"kernel":"%s"' "$(uname -r)"
+	printf ',"log_file":"%s"' "${LOG}"
+	printf ',"internal_devs":"%s"' "$(jesc "${INTERNAL_DEVS}")"
+	printf ',"internal_mount":"%s"' "$(jesc "${INTERNAL_MNT}")"
+	printf ',"storages":'
+	ol_storages_json
+	printf '}\n'
+}
+
+# ---------------------------------------------------------------- 主入口
+
+OPT_FORCE=0
+OPT_RO=0
+OPT_STOP=0
+OPT_YES=0
+OPT_INSTALL=0
+
+CMD="$1"
+[ $# -gt 0 ] && shift
+
+DEV=""
+FS=""
+for a in "$@"; do
+	case "$a" in
+		--force)   OPT_FORCE=1 ;;
+		--ro)      OPT_RO=1 ;;
+		--stop)    OPT_STOP=1 ;;
+		--yes)     OPT_YES=1 ;;
+		--install) OPT_INSTALL=1 ;;
+		-*)        ;;
+		*)
+			if [ -z "${DEV}" ]; then DEV="$a"; else FS="$a"; fi
+			;;
+	esac
+done
+
+mkdir -p "${MNTBASE}" 2>/dev/null
+
+case "${CMD}" in
+	mount)   do_mount "${DEV}" ;;
+	umount)  do_umount "${DEV}" ;;
+	clean)   do_clean "${DEV}" ;;
+	dirty)   do_dirty "${DEV}" ;;
+	eject)   do_eject "${DEV}" ;;
+	format)  do_format "${DEV}" "${FS}" ;;
+	openlist) do_openlist "${DEV}" ;;
+	tools)   do_tools ;;
+	list)    do_list ;;
+	json)    do_json ;;
+	status)  do_list ;;
+	olstorages) ol_storages_json; printf '\n' ;;
+	log)
+		n="${DEV:-40}"
+		tail -n "${n}" "${LOG}" 2>/dev/null || say "（还没有日志）"
+		;;
+	""|-h|--help|help)
+		cat <<'EOF'
+diskctl — 硬盘管家（OpenList 助手后端）
+
+  diskctl list                 列出所有可操作的盘/分区
+  diskctl json                 同上，JSON 格式（给界面用）
+  diskctl mount   <dev|all>    挂载          [--force] [--ro]
+  diskctl umount  <dev|all>    卸载          [--force] [--stop]
+  diskctl clean   <dev>        清 NTFS 脏标记
+  diskctl dirty   <dev>        只读检查是否有脏标记
+  diskctl eject   <dev>        安全弹出（刷缓存 + 断开设备，仅 USB）
+  diskctl format  <dev> <fs>   格式化        --yes（fs: exfat|vfat|ext4）
+  diskctl openlist start|stop  启停 OpenList
+  diskctl olstorages           OpenList 的存储列表（JSON）
+  diskctl tools [--install]    工具自检 / 一键安装
+  diskctl log [n]              看操作日志
+
+  dev 写分区名即可，例如 sda2。
+  内置 eMMC 数据分区（默认 mmcblk0p27）也在可操作范围内，
+  挂载点固定为 /mnt/emmc；但格式化和弹出对它一律拒绝。
+EOF
+		;;
+	*)
+		say "未知命令：${CMD}（敲 diskctl help 看用法）"
+		exit 1
+		;;
+esac
+
+exit $?

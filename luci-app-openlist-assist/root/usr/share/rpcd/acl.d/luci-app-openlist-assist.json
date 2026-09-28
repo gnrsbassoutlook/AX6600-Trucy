@@ -1,0 +1,19 @@
+{
+    "luci-app-openlist-assist": {
+        "description": "Grant access to OpenList Assist (USB disk mount UI)",
+        "read": {
+            "uci": [ "openlist-assist", "network", "fstab" ],
+            "file": {
+                "/usr/bin/diskctl": [ "read", "exec" ],
+                "/proc/mounts": [ "read" ],
+                "/proc/filesystems": [ "read" ]
+            }
+        },
+        "write": {
+            "uci": [ "openlist-assist" ],
+            "file": {
+                "/usr/bin/diskctl": [ "read", "exec" ]
+            }
+        }
+    }
+}

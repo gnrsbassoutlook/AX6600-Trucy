@@ -1,0 +1,1019 @@
+<%+header%>
+<%-
+-- luci-app-openlist-assist 主界面
+--
+-- 这一版的设计取向：**一块盘 = 一个开关**。
+--   插着的盘只露出「挂载 / 卸载」这一个动作，其它（强力挂载、强力卸载、
+--   检查健康、清脏标记、格式化）全收进每行的「⋯」里，默认不展开。
+--   「全部挂载 / 全部卸载」搬进独立的「批量操作」折叠面板，并明确写出
+--   范围是"勾选的那些盘"，不再是一个语义含糊的按钮。
+--
+-- 本页走 template() 渲染（不是 cbi()），所以整页没有任何表单标签 ——
+-- 按钮不会像 adhfilter 那样被 CBI 的表单包住、点一下就整页重载。
+-- 但模板里依然给每个按钮显式写了 type="button"，双保险。
+--
+-- 走 template() 的代价：框架要自己带 —— 文件开头一个 header include，
+-- 结尾一个 footer include。
+--
+-- ⚠️ 写这个模板时踩过的坑：Lua 模板注释块里**不能出现百分号加大于号**，
+--    那会提前终止代码块，把后面半截当文本输出到页面上（还会多 include
+--    一次 footer）。这里刻意不写出那个符号组合。
+%>
+<style>
+.oa {
+	--oa-fg:#2b3445; --oa-dim:#7b8794; --oa-bg:#fff; --oa-bg2:#f7f9fc;
+	--oa-line:#e3e8f0; --oa-brand:#5b7cfa; --oa-good:#12915f;
+	--oa-bad:#d93f3f; --oa-warn:#c07815;
+	font-size:13px; color:var(--oa-fg); line-height:1.6;
+}
+[data-darkmode="true"] .oa, .dark .oa {
+	--oa-fg:#dbe3ee; --oa-dim:#8e9bb0; --oa-bg:#1f2733; --oa-bg2:#242d3a;
+	--oa-line:#323d4d; --oa-brand:#6b8bff; --oa-good:#38c98a;
+	--oa-bad:#ff7070; --oa-warn:#f0a93b;
+}
+.oa * { box-sizing:border-box; }
+.oa-busy { pointer-events:none; opacity:.7; }
+.oa-dim { color:var(--oa-dim); font-weight:400; font-size:12px; }
+.oa-spacer { flex:1; }
+.oa-mono { font-family:ui-monospace,Menlo,Consolas,monospace; }
+
+/* ---------- 顶部状态条 ---------- */
+.oa-strip { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }
+.oa-chip { display:inline-flex; align-items:center; gap:6px; font-size:12px;
+	background:var(--oa-bg2); border:1px solid var(--oa-line); border-radius:20px; padding:4px 12px; }
+.oa-chip b { font-weight:600; font-family:ui-monospace,Menlo,Consolas,monospace; }
+.oa-chip .dot { width:7px; height:7px; border-radius:50%; background:var(--oa-dim); }
+.oa-chip.good .dot { background:var(--oa-good); }
+.oa-chip.bad  .dot { background:var(--oa-bad); }
+.oa-chip.warn .dot { background:var(--oa-warn); }
+
+/* ---------- 面板 ---------- */
+.oa-panel { background:var(--oa-bg); border:1px solid var(--oa-line); border-radius:10px;
+	margin-bottom:14px; overflow:hidden; }
+.oa-hd { display:flex; align-items:center; gap:10px; padding:10px 14px;
+	border-bottom:1px solid var(--oa-line); background:var(--oa-bg2); flex-wrap:wrap; }
+.oa-hd.oa-fold { cursor:pointer; user-select:none; }
+.oa-hd.oa-fold:hover { background:var(--oa-bg); }
+.oa-title { font-weight:600; font-size:14px; }
+.oa-sub { font-size:12px; color:var(--oa-dim); }
+.oa-caret { color:var(--oa-dim); transition:.18s; display:inline-block; }
+.oa-caret.open { transform:rotate(90deg); }
+.oa-body { padding:14px; }
+.oa-note { font-size:12px; color:var(--oa-dim); margin-bottom:12px; line-height:1.7; }
+.oa-note b { color:var(--oa-fg); }
+
+/* ---------- 按钮 ---------- */
+.oa-btn { font:inherit; font-size:12px; padding:5px 12px; border-radius:7px; cursor:pointer;
+	border:1px solid var(--oa-line); background:var(--oa-bg); color:var(--oa-fg);
+	transition:.15s; white-space:nowrap; }
+.oa-btn:hover:not(:disabled) { border-color:var(--oa-brand); color:var(--oa-brand); }
+.oa-btn:disabled { opacity:.4; cursor:default; }
+.oa-primary { background:var(--oa-brand); border-color:var(--oa-brand); color:#fff; }
+.oa-primary:hover:not(:disabled) { filter:brightness(1.1); color:#fff; }
+.oa-danger { color:var(--oa-bad); border-color:rgba(217,63,63,.4); }
+.oa-danger:hover:not(:disabled) { background:rgba(217,63,63,.1); border-color:var(--oa-bad); color:var(--oa-bad); }
+.oa-ghost { color:var(--oa-dim); }
+.oa-mini { font-size:11px; padding:3px 9px; }
+.oa-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.oa-sep { width:1px; height:20px; background:var(--oa-line); margin:0 3px; }
+
+/* ---------- 硬盘卡片 ---------- */
+.oa-disk { border:1px solid var(--oa-line); border-radius:10px; margin-bottom:12px; overflow:hidden; }
+.oa-disk:last-child { margin-bottom:0; }
+.oa-disk-hd { display:flex; align-items:center; gap:9px; padding:9px 13px; background:var(--oa-bg2);
+	border-bottom:1px solid var(--oa-line); flex-wrap:wrap; }
+.oa-disk-hd b { font-size:13px; font-family:ui-monospace,Menlo,Consolas,monospace; }
+
+/* 一行 = 一个可挂载目标 */
+.oa-row { display:flex; align-items:center; gap:12px; padding:11px 13px;
+	border-bottom:1px solid var(--oa-line); flex-wrap:wrap; }
+.oa-row-l { flex:1 1 300px; min-width:0; }
+.oa-row-t { display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+.oa-row-nm { font-weight:600; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; }
+.oa-row-s { font-size:11px; color:var(--oa-dim); margin-top:3px;
+	font-family:ui-monospace,Menlo,Consolas,monospace; word-break:break-all; }
+.oa-row-r { display:flex; align-items:center; gap:10px; flex:0 0 auto; }
+.oa-row-st { font-size:12px; color:var(--oa-dim); min-width:74px; text-align:right; }
+.oa-row-st.on { color:var(--oa-good); font-weight:600; }
+
+/* 开关 */
+.oa-sw { position:relative; width:46px; height:24px; border-radius:14px; padding:0; flex:0 0 auto;
+	border:1px solid var(--oa-line); background:var(--oa-line); cursor:pointer; transition:.18s; }
+.oa-sw::after { content:""; position:absolute; top:2px; left:2px; width:18px; height:18px;
+	border-radius:50%; background:#fff; transition:.18s; box-shadow:0 1px 3px rgba(0,0,0,.3); }
+.oa-sw:hover:not(:disabled) { border-color:var(--oa-brand); }
+.oa-sw.on { background:var(--oa-good); border-color:var(--oa-good); }
+.oa-sw.on::after { left:24px; }
+.oa-sw:disabled { opacity:.35; cursor:not-allowed; }
+.oa-more { font:inherit; font-size:14px; line-height:1; padding:4px 8px; border-radius:7px;
+	border:1px solid transparent; background:transparent; color:var(--oa-dim); cursor:pointer; }
+.oa-more:hover { border-color:var(--oa-line); color:var(--oa-fg); }
+.oa-more.open { color:var(--oa-brand); border-color:var(--oa-line); }
+
+.oa-morebox { display:none; padding:11px 13px; background:var(--oa-bg2);
+	border-bottom:1px solid var(--oa-line); }
+.oa-morebox.open { display:block; }
+.oa-morebox .oa-actions { gap:7px; }
+.oa-morebox-t { font-size:11px; color:var(--oa-dim); margin-bottom:8px; }
+
+/* 徽章 */
+.oa-b { display:inline-block; font-size:10px; padding:1px 7px; border-radius:20px;
+	border:1px solid transparent; white-space:nowrap; }
+.oa-b-ok   { background:rgba(18,145,95,.12); color:var(--oa-good); border-color:rgba(18,145,95,.35); }
+.oa-b-idle { background:rgba(123,135,148,.12); color:var(--oa-dim);  border-color:rgba(123,135,148,.35); }
+.oa-b-off  { background:rgba(192,120,21,.12); color:var(--oa-warn); border-color:rgba(192,120,21,.35); }
+.oa-b-fs   { background:rgba(91,124,250,.12); color:var(--oa-brand); border-color:rgba(91,124,250,.35);
+	font-family:ui-monospace,Menlo,Consolas,monospace; }
+.oa-b-ol   { background:rgba(18,145,95,.12); color:var(--oa-good); border-color:rgba(18,145,95,.35); }
+.oa-b-oldown { background:rgba(217,63,63,.12); color:var(--oa-bad); border-color:rgba(217,63,63,.35); }
+
+/* 用量条 */
+.oa-bar { height:5px; border-radius:4px; background:var(--oa-line); margin-top:7px; overflow:hidden; max-width:340px; }
+.oa-bar i { display:block; height:100%; background:var(--oa-brand); }
+.oa-bar i.hi { background:var(--oa-warn); }
+.oa-bar i.full { background:var(--oa-bad); }
+
+.oa-empty { padding:26px 14px; text-align:center; color:var(--oa-dim); }
+.oa-err { background:rgba(217,63,63,.1); border:1px solid rgba(217,63,63,.4);
+	color:var(--oa-bad); padding:10px 12px; border-radius:8px; margin-bottom:12px; font-size:12px; }
+
+/* 批量列表 */
+.oa-bl { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:8px; margin:10px 0; }
+.oa-bl label { display:flex; align-items:center; gap:8px; font-size:12px; padding:7px 10px;
+	border:1px solid var(--oa-line); border-radius:8px; cursor:pointer; }
+.oa-bl label:hover { border-color:var(--oa-brand); }
+.oa-bl .oa-bl-t { font-family:ui-monospace,Menlo,Consolas,monospace; font-weight:600; }
+.oa-opt { display:flex; align-items:center; gap:8px; font-size:12px; margin:10px 0 12px; }
+
+/* OpenList 存储表 */
+.oa-tbl { width:100%; border-collapse:collapse; font-size:12px; }
+.oa-tbl th, .oa-tbl td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--oa-line); }
+.oa-tbl th { color:var(--oa-dim); font-weight:500; font-size:11px; }
+.oa-tbl td.mono { font-family:ui-monospace,Menlo,Consolas,monospace; word-break:break-all; }
+.oa-tbl tr:last-child td { border-bottom:none; }
+
+/* 结果打印 */
+.oa-term { background:var(--oa-bg2); border:1px solid var(--oa-line); border-radius:9px;
+	max-height:460px; overflow:auto; padding:10px 12px; }
+.oa-term:empty::before { content:"点上面的开关或按钮开始。所有操作的原样输出都会打在这里。"; color:var(--oa-dim); }
+.oa-blk { border-bottom:1px dashed var(--oa-line); padding:8px 0; }
+.oa-blk:last-child { border-bottom:none; }
+.oa-blk-t { font-size:12px; font-weight:600; margin-bottom:5px; }
+.oa-blk.ok  .oa-blk-t { color:var(--oa-good); }
+.oa-blk.bad .oa-blk-t { color:var(--oa-bad); }
+.oa-blk pre { margin:0; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px;
+	white-space:pre-wrap; word-break:break-all; color:var(--oa-fg); }
+
+.oa-tip { font-size:12px; color:var(--oa-dim); margin-top:12px; }
+.oa-tip code { background:var(--oa-bg2); border:1px solid var(--oa-line); border-radius:4px;
+	padding:0 4px; font-size:11px; }
+
+.oa-toast { position:fixed; left:50%; bottom:28px; transform:translate(-50%,20px); max-width:min(680px,92vw);
+	background:#2b3445; color:#fff; padding:10px 16px; border-radius:9px; font-size:13px; z-index:9999;
+	opacity:0; pointer-events:none; transition:.22s; white-space:pre-wrap; box-shadow:0 6px 24px rgba(0,0,0,.28); }
+.oa-toast.show { opacity:1; transform:translate(-50%,0); }
+.oa-toast.good { background:#12915f; }
+.oa-toast.bad  { background:#d93f3f; }
+
+@media (max-width:700px) {
+	.oa-row-r { flex:1 1 100%; justify-content:flex-end; }
+	.oa-row-st { min-width:auto; }
+}
+</style>
+
+<div class="oa" id="oa-root">
+	<div id="oa-warn"></div>
+	<div class="oa-strip" id="oa-strip"></div>
+
+	<!-- ============ 硬盘（USB） ============ -->
+	<div class="oa-panel">
+		<div class="oa-hd">
+			<span class="oa-title">USB 硬盘</span>
+			<span class="oa-sub" id="oa-sub"></span>
+			<span class="oa-spacer"></span>
+			<button type="button" class="oa-btn oa-ghost" id="oa-refresh">刷新</button>
+		</div>
+		<div class="oa-body"><div id="oa-devs"></div></div>
+	</div>
+
+	<!-- ============ 内置存储 ============ -->
+	<div class="oa-panel" id="oa-int-panel" style="display:none">
+		<div class="oa-hd">
+			<span class="oa-title">内置存储</span>
+			<span class="oa-sub">路由器自己的 eMMC 数据分区，不占用 USB 口</span>
+		</div>
+		<div class="oa-body">
+			<div id="oa-int-devs"></div>
+			<div class="oa-note" id="oa-int-note"></div>
+		</div>
+	</div>
+
+	<!-- ============ 批量操作 ============ -->
+	<div class="oa-panel">
+		<div class="oa-hd oa-fold" id="oa-batch-hd">
+			<span class="oa-caret" id="oa-batch-caret">&#9656;</span>
+			<span class="oa-title">批量操作</span>
+			<span class="oa-sub">一次处理多块盘</span>
+			<span class="oa-spacer"></span>
+			<span class="oa-sub" id="oa-batch-sum"></span>
+		</div>
+		<div class="oa-body" id="oa-batch-body" style="display:none">
+			<div class="oa-note">
+				范围：<b>下面勾选的那些盘</b>（只含 USB 硬盘，<b>不含</b>内置存储 ——
+				内置存储请到上面那块面板单独操作）。
+				没勾任何一块时按钮点不动。
+			</div>
+			<div class="oa-bl" id="oa-batch-list"></div>
+			<label class="oa-opt">
+				<input type="checkbox" id="oa-batch-force">
+				强制模式：挂载时遇到带脏标记的盘自动 force；卸载时卸不掉自动转 lazy，
+				并临时停掉 OpenList（卸完自动拉起）
+			</label>
+			<div class="oa-actions">
+				<button type="button" class="oa-btn oa-primary" id="oa-b-mount">挂载选中</button>
+				<button type="button" class="oa-btn oa-danger" id="oa-b-umount">卸载选中</button>
+				<span class="oa-sep"></span>
+				<button type="button" class="oa-btn oa-ghost oa-mini" id="oa-b-all">全选</button>
+				<button type="button" class="oa-btn oa-ghost oa-mini" id="oa-b-none">全不选</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- ============ OpenList ============ -->
+	<div class="oa-panel">
+		<div class="oa-hd">
+			<span class="oa-title">OpenList</span>
+			<span class="oa-sub" id="oa-ol-sub"></span>
+			<span class="oa-spacer"></span>
+			<button type="button" class="oa-btn oa-primary" id="oa-ol-start">启动</button>
+			<button type="button" class="oa-btn" id="oa-ol-stop">停止</button>
+			<a class="oa-btn" id="oa-ol-open" href="#" target="_blank" rel="noopener">打开面板</a>
+		</div>
+		<div class="oa-body">
+			<div id="oa-ol-body"></div>
+		</div>
+	</div>
+
+	<!-- ============ 工具 ============ -->
+	<div class="oa-panel">
+		<div class="oa-hd">
+			<span class="oa-title">工具自检</span>
+			<span class="oa-sub">exFAT / NTFS / FAT32 的驱动与格式化程序分别什么状态</span>
+			<span class="oa-spacer"></span>
+			<button type="button" class="oa-btn" id="oa-tools">检查</button>
+			<button type="button" class="oa-btn oa-primary" id="oa-tools-install">一键安装</button>
+		</div>
+		<div class="oa-body">
+			<pre class="oa-mono" id="oa-tools-out" style="margin:0;font-size:12px;white-space:pre-wrap;color:var(--oa-dim)">点「检查」看看缺什么。换了新格式的 U 盘挂不上，先来这里装 exFAT 工具。</pre>
+		</div>
+	</div>
+
+	<!-- ============ 执行结果 ============ -->
+	<div class="oa-panel">
+		<div class="oa-hd">
+			<span class="oa-title">执行结果</span>
+			<span class="oa-sub" id="oa-out-hint"></span>
+			<span class="oa-spacer"></span>
+			<button type="button" class="oa-btn oa-ghost" id="oa-clear">清空</button>
+		</div>
+		<div class="oa-body">
+			<div class="oa-term" id="oa-out"></div>
+			<div class="oa-tip">
+				每一步的原始输出都在上面。命令行也一样能用：
+				<code>diskctl status</code> · <code>diskctl mount sda2</code> ·
+				<code>diskctl clean sda2</code> · <code>diskctl olstorages</code> ·
+				<code>diskctl help</code>
+			</div>
+		</div>
+	</div>
+</div>
+
+<div class="oa-toast" id="oa-toast"></div>
+
+<script>
+(function () {
+	"use strict";
+
+	var U_DEV = "<%=url('admin/services/openlist-assist/devices')%>";
+	var U_ACT = "<%=url('admin/services/openlist-assist/action')%>";
+
+	var busyFlag = false;
+	var S = { devs: [], storages: null, openlist: {}, internalMnt: "/mnt/emmc" };
+	var OL_ROOTS = {};      /* 挂载点 -> OpenList 存储名，用于联动 */
+	var CHECKED = {};       /* 批量操作勾选状态 */
+
+	/* ---------------------------------------------------------- 基础工具 */
+
+	function esc(s) {
+		return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+			return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+		});
+	}
+	function el(id) { return document.getElementById(id); }
+
+	function token() {
+		try {
+			if (window.L && L.env && L.env.token) { return L.env.token; }
+			var i = document.querySelector('input[name="token"]');
+			if (i) { return i.value; }
+		} catch (e) {}
+		return "";
+	}
+
+	var toastTimer = null;
+	function toast(msg, kind) {
+		var t = el("oa-toast");
+		t.textContent = msg;
+		t.className = "oa-toast show" + (kind ? " " + kind : "");
+		if (toastTimer) { clearTimeout(toastTimer); }
+		toastTimer = setTimeout(function () { t.className = "oa-toast"; }, 4200);
+	}
+
+	function busy(on) {
+		busyFlag = on;
+		var root = el("oa-root");
+		if (on) { root.classList.add("oa-busy"); } else { root.classList.remove("oa-busy"); }
+	}
+
+	function human(b) {
+		b = Number(b) || 0;
+		if (b <= 0) { return "0"; }
+		var u = ["B", "K", "M", "G", "T", "P"], i = 0;
+		while (b >= 1024 && i < 5) { b /= 1024; i++; }
+		return (i === 0 ? b.toFixed(0) : b.toFixed(1)) + u[i];
+	}
+	function humanKb(kb) { return human((Number(kb) || 0) * 1024); }
+
+	/* 结果打印：用 DOM API 追加，不拼 HTML —— 输出里再怪的字符也安全 */
+	function print(title, text, ok) {
+		var box = el("oa-out");
+		var d = document.createElement("div");
+		d.className = "oa-blk" + (ok === true ? " ok" : ok === false ? " bad" : "");
+		var h = document.createElement("div");
+		h.className = "oa-blk-t";
+		h.textContent = (ok === true ? "✅ " : ok === false ? "❌ " : "▸ ")
+			+ title + "    " + new Date().toLocaleTimeString();
+		var p = document.createElement("pre");
+		p.textContent = text;
+		d.appendChild(h);
+		d.appendChild(p);
+		box.appendChild(d);
+		box.scrollTop = box.scrollHeight;
+		el("oa-out-hint").textContent = title;
+	}
+
+	/* 原生 XHR。不用 luci 自带的 xhr.js：
+	   老版它的 post 回调只给 xhr 不解析，且 get 只在 Content-Type 恰好等于
+	   application/json 时才 JSON.parse，坑多。这里自己来，行为完全可控。 */
+	function req(method, url, data, cb) {
+		var x = new XMLHttpRequest();
+		x.open(method, url, true);
+		x.timeout = 900000;                       /* 格式化/装工具可能好几分钟 */
+		if (method === "POST") {
+			x.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+		}
+		x.onreadystatechange = function () {
+			if (x.readyState !== 4) { return; }
+			var d = null;
+			try { d = JSON.parse(x.responseText); } catch (e) { d = null; }
+			cb(d, x);
+		};
+		x.ontimeout = function () { cb(null, x); };
+		x.send(data || null);
+	}
+
+	function post(action, params, cb) {
+		var kv = ["action=" + encodeURIComponent(action)];
+		params = params || {};
+		for (var k in params) {
+			if (params[k] !== undefined && params[k] !== null && params[k] !== "") {
+				kv.push(k + "=" + encodeURIComponent(params[k]));
+			}
+		}
+		var t = token();
+		if (t) { kv.push("token=" + encodeURIComponent(t)); }
+		req("POST", U_ACT, kv.join("&"), cb);
+	}
+
+	/* ---------------------------------------------------------- 顶部状态条 */
+
+	function renderStrip(d) {
+		/* ★ 必须把「整盘」和「分区」分开数。
+		   多盘位的硬盘柜插上来，sda1/sda2/sdb1/sdc1/sdd 会同时是一行行记录，
+		   混在一起数就成了「USB 盘 8」，看着像插了 8 块盘 —— 严重误导。 */
+		var usb = (d.devs || []).filter(function (x) {
+			return x.kind === "part" || x.kind === "disk";
+		});
+		var usbDisks = usb.filter(function (x) { return x.kind === "disk"; });
+		var usbParts = usb.filter(function (x) { return x.fstype && x.kind === "part"; });
+		var mounted = (d.devs || []).filter(function (x) { return x.mounted; });
+		var ints = (d.devs || []).filter(function (x) {
+			return x.kind === "internal" || x.kind === "ipart";
+		});
+		var ol = d.openlist || {}, t = d.tools || {};
+		var st = d.storages || { ok: false, storage: [] };
+
+		var chips = [
+			{ k: usbDisks.length ? "good" : "warn", t: "USB 硬盘",
+			  v: usbDisks.length + " 块 · " + usbParts.length + " 分区" },
+			{ k: mounted.length ? "good" : "warn", t: "已挂载", v: String(mounted.length) },
+			{ k: ol.running ? "good" : "warn", t: "OpenList",
+			  v: ol.running ? "运行中" : "已停止" },
+			{ k: st.ok ? (st.storage.length ? "good" : "") : "",
+			  t: "OpenList 存储", v: st.ok ? String(st.storage.length) + " 个" : "读不到" },
+			{ k: ints.length ? "good" : "", t: "内置存储",
+			  v: ints.length ? (ints[0].mounted ? "已挂载" : "未挂载") : "无" },
+			{ k: t.ntfs3 ? "good" : "bad", t: "NTFS", v: t.ntfs3 ? "内置" : "缺失" },
+			{ k: t.exfat ? "good" : "bad", t: "exFAT", v: t.exfat ? "内置" : "缺失" }
+		];
+
+		var html = chips.map(function (c) {
+			return '<span class="oa-chip ' + c.k + '"><span class="dot"></span>'
+			     + esc(c.t) + ' <b>' + esc(c.v) + "</b></span>";
+		}).join("");
+
+		/* 存储的根路径没挂上 → 顶部直接点出来 */
+		if (st.ok) {
+			var down = st.storage.filter(function (s) {
+				return s.root && !isPathMounted(s.root);
+			});
+			if (down.length) {
+				html += '<span class="oa-chip bad"><span class="dot"></span>存储离线 <b>'
+				     + down.length + "</b></span>";
+			}
+		}
+		el("oa-strip").innerHTML = html;
+
+		var warn = el("oa-warn");
+		if (!usbDisks.length) {
+			warn.innerHTML = '<div class="oa-err">没有检测到 USB 硬盘。插好线、等两三秒再点「刷新」。'
+				+ "如果插的是带外接电源的硬盘柜，确认柜子已经通电开机。</div>";
+		} else {
+			warn.innerHTML = "";
+		}
+	}
+
+	function isPathMounted(p) {
+		return (S.devs || []).some(function (x) { return x.mounted && x.mount === p; });
+	}
+
+	/* ---------------------------------------------------------- 设备渲染 */
+
+	function badge(txt, cls) {
+		return '<span class="oa-b ' + cls + '">' + esc(txt) + "</span>";
+	}
+
+	/* 一块「可挂载目标」的全部按钮：开关 + ⋯ 展开的次要动作 */
+	function rowHtml(x, group) {
+		var isInt = (x.kind === "internal" || x.kind === "ipart");
+		var nofs = !x.fstype;
+
+		var olUse = null;                     /* 这个目标被哪个存储引用 */
+		if (S.storages && S.storages.ok) {
+			var defPath = isInt ? S.internalMnt : ("/mnt/" + x.name);
+			for (var i = 0; i < S.storages.storage.length; i++) {
+				var s = S.storages.storage[i];
+				if (s.root && (s.root === x.mount || s.root === defPath)) { olUse = s; break; }
+			}
+		}
+
+		/* ---- 左侧：名字 + 徽章 + 明细 ---- */
+		var badges = badge(x.fstype || "无文件系统", x.fstype ? "oa-b-fs" : "oa-b-off");
+		if (x.mounted) {
+			badges += badge("已挂载", "oa-b-ok");
+		} else if (nofs) {
+			badges += badge("挂不了", "oa-b-off");
+		} else {
+			badges += badge("未挂载", "oa-b-idle");
+		}
+		if (isInt) { badges += badge("内置", "oa-b-fs"); }
+		if (olUse) { badges += badge("OpenList · " + olUse.mount_path, "oa-b-ol"); }
+
+		var info = "/dev/" + x.name + "  ·  " + x.size_h;
+		if (x.label) { info += "  ·  卷标 " + x.label; }
+		if (x.mounted) { info += "  ·  → " + x.mount; }
+		else if (x.uuid) { info += "  ·  UUID " + x.uuid; }
+		else if (x.model) { info += "  ·  " + x.model; }
+
+		var bar = "";
+		if (x.mounted && x.total_kb > 0) {
+			var pct = Math.round(x.used_kb / x.total_kb * 100);
+			var cls = pct >= 95 ? "full" : (pct >= 80 ? "hi" : "");
+			bar = '<div class="oa-bar"><i class="' + cls + '" style="width:' + pct + '%"></i></div>'
+			    + '<div class="oa-row-s">已用 ' + humanKb(x.used_kb) + " / " + humanKb(x.total_kb)
+			    + "（" + pct + "%）</div>";
+		}
+
+		/* ---- 右侧：开关 + ⋯ ---- */
+		var stTxt, sw;
+		if (nofs) {
+			stTxt = '<span class="oa-row-st">—</span>';
+			sw = '<button type="button" class="oa-sw" disabled title="没有文件系统，挂不上"></button>';
+		} else if (x.mounted) {
+			stTxt = '<span class="oa-row-st on">已挂载</span>';
+			/* ★ 联动：这块盘正被 OpenList 用着，直接卸载一定 busy。
+			   所以开关自动带上 stop —— 先临时停 OpenList，卸完自动拉回来。 */
+			var needStop = olUse ? ' data-stop="1"' : "";
+			var tip = olUse
+				? "点一下卸载（会先临时停 OpenList，卸完自动拉起）"
+				: "点一下卸载";
+			sw = '<button type="button" class="oa-sw on" data-act="umount" data-dev="' + esc(x.name)
+			   + '"' + needStop + ' title="' + esc(tip) + '"></button>';
+		} else {
+			stTxt = '<span class="oa-row-st">未挂载</span>';
+			sw = '<button type="button" class="oa-sw" data-act="mount" data-dev="' + esc(x.name)
+			   + '" title="点一下挂载"></button>';
+		}
+
+		var moreId = "more-" + x.name;
+		var more = '<button type="button" class="oa-more" data-more="' + esc(moreId)
+		         + '" title="更多操作">&#8943;</button>';
+
+		var row = '<div class="oa-row">'
+			+ '<div class="oa-row-l">'
+			+   '<div class="oa-row-t"><span class="oa-row-nm">' + esc(x.name) + "</span>" + badges + "</div>"
+			+   '<div class="oa-row-s">' + esc(info) + "</div>"
+			+   bar
+			+ "</div>"
+			+ '<div class="oa-row-r">' + stTxt + sw + more + "</div>"
+			+ "</div>";
+
+		/* ---- ⋯ 展开的次要动作 ---- */
+		var acts = "";
+		if (!nofs) {
+			if (x.mounted) {
+				acts += btn("umount", x.name, "强力卸载", "oa-danger", { force: 1, stop: 1 });
+			} else {
+				acts += btn("mount", x.name, "强力挂载", "", { force: 1 });
+			}
+			acts += btn("dirty", x.name, "检查健康", "", {});
+			if (!isInt) { acts += btn("clean", x.name, "清除脏标记", "", { stop: 1 }); }
+		}
+
+		var morebox = '<div class="oa-morebox" id="' + esc(moreId) + '">'
+			+ '<div class="oa-morebox-t">'
+			+ (nofs
+				? "这个分区没有文件系统（多半是 Windows 的保留分区），本来就不需要挂载。"
+				: (x.mounted ? "挂载点 " + esc(x.mount) + " —— 卸不掉时用「强力卸载」。"
+				             : "普通挂载失败时（比如盘带脏标记）用「强力挂载」。"))
+			+ "</div>";
+
+		if (!nofs) {
+			morebox += '<div class="oa-actions">' + acts;
+			if (!x.mounted && !isInt) {
+				morebox += '<span class="oa-sep"></span>'
+					+ btnFmt(x.name, "exfat", "格式化为 exFAT")
+					+ btnFmt(x.name, "vfat", "格式化为 FAT32")
+					+ btnFmt(x.name, "ext4", "格式化为 ext4");
+			}
+			morebox += "</div>";
+			if (!isInt) {
+				morebox += '<div class="oa-morebox-t" style="margin:8px 0 0">'
+					+ "格式化会清空这块分区上的全部数据，按钮会让你手打一遍设备名才执行。</div>";
+			}
+		}
+		morebox += "</div>";
+
+		return row + morebox;
+	}
+
+	function btn(act, dev, label, cls, extra) {
+		var attrs = 'data-act="' + esc(act) + '" data-dev="' + esc(dev) + '"';
+		var o = extra || {};
+		if (o.force) { attrs += ' data-force="1"'; }
+		if (o.stop) { attrs += ' data-stop="1"'; }
+		return '<button type="button" class="oa-btn oa-mini ' + (cls || "") + '" ' + attrs + ">"
+		     + esc(label) + "</button>";
+	}
+
+	function btnFmt(dev, fs, label) {
+		return '<button type="button" class="oa-btn oa-mini oa-danger" data-fmt="' + esc(fs)
+		     + '" data-dev="' + esc(dev) + '">' + esc(label) + "</button>";
+	}
+
+	/* USB：显式按 parent 分组，而不是「遇到整盘才开卡片」——
+	   这样即使后端把分区排在整盘前面（曾经因为 sort 的比较符出过这个问题），
+	   也不会出现没有边框的裸行。 */
+	function groupByParent(devs) {
+		var byKey = {}, order = [];
+		devs.forEach(function (x) {
+			var key = (x.kind === "disk" || x.kind === "internal")
+				? x.name : (x.parent || x.name);
+			if (!byKey[key]) { byKey[key] = { disk: null, parts: [] }; order.push(key); }
+			if (x.kind === "disk" || x.kind === "internal") { byKey[key].disk = x; }
+			else { byKey[key].parts.push(x); }
+		});
+		return order.map(function (k) { return byKey[k]; });
+	}
+
+	function diskHead(x, extra) {
+		return '<div class="oa-disk-hd">'
+			+ "<b>/dev/" + esc(x.name) + "</b>"
+			+ '<span class="oa-dim">' + esc(x.size_h) + "</span>"
+			+ (x.model ? '<span class="oa-dim">' + esc(x.model) + "</span>" : "")
+			+ (x.fstype ? badge(x.fstype, "oa-b-fs") : "")
+			+ "<span class='oa-spacer'></span>"
+			+ (extra || "")
+			+ "</div>";
+	}
+
+	function renderDevs(d) {
+		var devs = (d.devs || []).filter(function (x) {
+			return x.kind === "disk" || x.kind === "part";
+		});
+		if (!devs.length) {
+			el("oa-devs").innerHTML = '<div class="oa-empty">还没有插 USB 硬盘。</div>';
+			return;
+		}
+		el("oa-devs").innerHTML = groupByParent(devs).map(function (g) {
+			var hd = g.disk
+				? diskHead(g.disk,
+					'<button type="button" class="oa-btn oa-mini" data-act="eject" data-dev="'
+					+ esc(g.disk.name) + '" data-stop="1"'
+					+ ' title="先卸载它所有分区、刷缓存、断开设备，然后就能安全拔线">安全弹出</button>')
+				: diskHead({ name: (g.parts[0] && g.parts[0].parent) || "?", size_h: "",
+				             model: "", fstype: "" }, "");
+			/* 整盘自己带文件系统（没有分区表的小 U 盘）→ 也给它一行 */
+			var rows = "";
+			if (g.disk && g.disk.fstype) { rows += rowHtml(g.disk, "disk"); }
+			rows += g.parts.map(function (p) { return rowHtml(p, "part"); }).join("");
+			return '<div class="oa-disk">' + hd + rows + "</div>";
+		}).join("");
+	}
+
+	function renderInternal(d) {
+		var ints = (d.devs || []).filter(function (x) {
+			return x.kind === "internal" || x.kind === "ipart";
+		});
+		if (!ints.length) { el("oa-int-panel").style.display = "none"; return; }
+		el("oa-int-panel").style.display = "";
+
+		/* 全部塞进同一张卡片。白名单里通常只放行一个分区（mmcblk0p27），
+		   整盘 mmcblk0 本身不在名单里，所以取 parent 当标题。 */
+		var groups = groupByParent(ints);
+		el("oa-int-devs").innerHTML = groups.map(function (g) {
+			var hd = g.disk
+				? diskHead(g.disk, "")
+				: diskHead({ name: (g.parts[0] && g.parts[0].parent) || "?",
+				             size_h: (g.parts[0] && g.parts[0].size_h) || "",
+				             model: (g.parts[0] && g.parts[0].model) || "", fstype: "" }, "");
+			var rows = "";
+			if (g.disk && g.disk.fstype) { rows += rowHtml(g.disk, "internal"); }
+			rows += g.parts.map(function (p) { return rowHtml(p, "internal"); }).join("");
+			return '<div class="oa-disk">' + hd + rows + "</div>";
+		}).join("");
+
+		el("oa-int-note").innerHTML =
+			"内置 eMMC 的数据分区挂载点是 <b class='oa-mono'>" + esc(d.internal_mount || "/mnt/emmc")
+			+ "</b>。它出厂就是空的，适合当临时中转区（解压临时目录、待整理的文件）。"
+			+ "⚠️ eMMC 有写入寿命，别拿它当 7×24 的下载盘用。"
+			+ "要开机自动挂上，在 SSH 里跑 <code>uci set fstab.@mount[2].enabled=1 &amp;&amp; uci commit fstab</code>。";
+	}
+
+	/* ---------------------------------------------------------- 批量操作 */
+
+	function mountable() {
+		/* 批量只针对 USB：有文件系统、且不是内置白名单 */
+		return (S.devs || []).filter(function (x) {
+			if (x.kind === "internal" || x.kind === "ipart") { return false; }
+			if (x.kind === "part" || x.kind === "disk") { return !!x.fstype; }
+			return false;
+		});
+	}
+
+	function renderBatch() {
+		var list = mountable();
+		var box = el("oa-batch-list");
+		if (!list.length) {
+			box.innerHTML = '<div class="oa-dim">没有可批量操作的 USB 分区。</div>';
+			el("oa-batch-sum").textContent = "";
+			return;
+		}
+		/* 首次出现的目标默认勾上；拔掉的自动清掉 */
+		var seen = {};
+		list.forEach(function (x) {
+			seen[x.name] = 1;
+			if (CHECKED[x.name] === undefined) { CHECKED[x.name] = true; }
+		});
+		Object.keys(CHECKED).forEach(function (k) { if (!seen[k]) { delete CHECKED[k]; } });
+
+		box.innerHTML = list.map(function (x) {
+			return '<label><input type="checkbox" data-chk="' + esc(x.name) + '"'
+			     + (CHECKED[x.name] ? " checked" : "") + ">"
+			     + '<span class="oa-bl-t">' + esc(x.name) + "</span>"
+			     + '<span class="oa-dim">' + esc(x.fstype) + " · " + esc(x.size_h)
+			     + (x.mounted ? " · 已挂载" : "") + "</span></label>";
+		}).join("");
+		updateBatchSum();
+	}
+
+	function checkedNames() {
+		return Object.keys(CHECKED).filter(function (k) { return CHECKED[k]; });
+	}
+
+	function updateBatchSum() {
+		var n = checkedNames().length;
+		el("oa-batch-sum").textContent = n ? ("已勾选 " + n + " 块") : "未勾选任何一块";
+	}
+
+	/* ---------------------------------------------------------- OpenList 面板 */
+
+	function renderOpenList(d) {
+		var ol = d.openlist || {};
+		var st = d.storages || { ok: false, err: "", storage: [] };
+
+		el("oa-ol-sub").textContent = ol.running ? ("运行中 · pid " + (ol.pid || "?")) : "已停止";
+		el("oa-ol-start").disabled = !!ol.running;
+		el("oa-ol-stop").disabled = !ol.running;
+		try {
+			el("oa-ol-open").href = location.protocol + "//" + location.hostname + ":5244";
+		} catch (e) {}
+
+		if (!st.ok) {
+			el("oa-ol-body").innerHTML = '<div class="oa-err">读不到 OpenList 的存储列表：'
+				+ esc(st.err || "未知原因")
+				+ "<br>（盘还是能正常挂载卸载的，只是这里看不到存储对应关系。"
+				+ "OpenList 没在跑的时候就会这样。）</div>";
+			return;
+		}
+
+		if (!st.storage.length) {
+			el("oa-ol-body").innerHTML =
+				'<div class="oa-empty">OpenList 里还没有配置任何存储。'
+				+ '想让它提供这块盘的内容，就到 OpenList 面板里「存储 → 添加」。</div>';
+			return;
+		}
+
+		var rows = st.storage.map(function (s) {
+			var rootMounted = s.root && isPathMounted(s.root);
+			var on = rootMounted && !s.disabled;
+			var state = s.disabled ? badge("已停用", "oa-b-idle")
+				: (rootMounted ? badge("在线", "oa-b-ok") : badge("根路径未挂载", "oa-b-oldown"));
+			return "<tr>"
+				+ '<td class="mono">' + esc(s.mount_path) + "</td>"
+				+ "<td>" + esc(s.driver) + "</td>"
+				+ '<td class="mono">' + esc(s.root || "—") + "</td>"
+				+ "<td>" + state + "</td>"
+				+ "</tr>";
+		}).join("");
+
+		var downCount = st.storage.filter(function (s) {
+			return s.root && !isPathMounted(s.root) && !s.disabled;
+		}).length;
+
+		el("oa-ol-body").innerHTML =
+			'<table class="oa-tbl"><thead><tr><th>存储（挂载路径）</th><th>类型</th>'
+			+ "<th>实际根路径</th><th>状态</th></tr></thead><tbody>" + rows + "</tbody></table>"
+			+ '<div class="oa-note" style="margin:12px 0 0">'
+			+ "OpenList 的存储并不会「挂载」任何东西 —— 它只是<b>指向一个本地路径</b>。"
+			+ "所以盘一卸载，对应的存储就会变成「根路径未挂载」，网页上那里会报错。"
+			+ "本页的开关在这种盘上会自动帮你先停 OpenList、卸完再拉回来。</div>"
+			+ (downCount ? '<div class="oa-err" style="margin-top:10px">有 ' + downCount
+				+ " 个存储的根路径当前没挂载，OpenList 里那两个目录是打不开的。</div>" : "");
+	}
+
+	/* ---------------------------------------------------------- 载入 */
+
+	function load(quiet) {
+		req("GET", U_DEV, null, function (d, x) {
+			if (!d) {
+				if (!quiet) {
+					toast("读取设备列表失败（HTTP " + ((x && x.status) || "?") + "）", "bad");
+					print("读取设备列表", "接口没有返回合法 JSON。\nHTTP " + ((x && x.status) || "?")
+						+ "\n\n可能原因：LuCI 缓存过期。到「系统 → 系统 → 刷新」或重启一下 uhttpd。", false);
+				}
+				return;
+			}
+			if (d.err) { print("读取设备列表", d.err, false); }
+
+			S.devs = d.devs || [];
+			S.storages = d.storages || null;
+			S.openlist = d.openlist || {};
+			S.internalMnt = d.internal_mount || "/mnt/emmc";
+
+			/* 挂载点 -> 存储名，供行内徽章和卸载联动使用 */
+			OL_ROOTS = {};
+			if (S.storages && S.storages.ok) {
+				S.storages.storage.forEach(function (s) {
+					if (s.root) { OL_ROOTS[s.root] = s.mount_path; }
+				});
+			}
+
+			var sub = el("oa-sub");
+			var parts = mountable();
+			var mounted = parts.filter(function (p) { return p.mounted; });
+			sub.textContent = parts.length
+				? ("共 " + parts.length + " 个分区，" + mounted.length + " 个已挂载")
+				: "没有检测到 USB 硬盘";
+
+			renderStrip(d);
+			renderDevs(d);
+			renderInternal(d);
+			renderBatch();
+			renderOpenList(d);
+		});
+	}
+
+	/* ---------------------------------------------------------- 执行动作 */
+
+	var LABEL = {
+		mount: "挂载", umount: "卸载",
+		clean: "清除脏标记", dirty: "检查文件系统", eject: "安全弹出", format: "格式化",
+		openlist_start: "启动 OpenList", openlist_stop: "停止 OpenList"
+	};
+
+	function runAction(action, params, title, cb) {
+		if (busyFlag) { return; }
+		busy(true);
+		print(title, "正在执行…（这一步可能要等几秒到几十秒，别关页面）", null);
+
+		post(action, params, function (d, x) {
+			busy(false);
+
+			var box = el("oa-out");
+			if (box.lastElementChild) { box.removeChild(box.lastElementChild); }
+
+			if (!d) {
+				var code = (x && x.status) || "?";
+				var why = (x && x.status === 0)
+					? "连接被中断或超时。如果操作本身很慢（格式化、装工具），到 SSH 里用 diskctl 会更稳。"
+					: "HTTP " + code + "。";
+				print(title, "没有拿到结果：\n" + why, false);
+				toast(title + "：没有拿到结果", "bad");
+				if (cb) { cb(false); }
+				return;
+			}
+
+			print(title, d.msg || "(无输出)", d.ok);
+			toast(d.ok ? (title + " 完成") : (title + " 失败，看下方输出"), d.ok ? "good" : "bad");
+
+			/* 列表状态跟着刷新（卸载/挂载后徽章、OpenList 存储状态要立刻变） */
+			if (action !== "log" && action !== "tools" && action !== "tools_install") {
+				setTimeout(function () { load(true); }, 600);
+			}
+			if (cb) { cb(d.ok); }
+		});
+	}
+
+	/* 批量：逐个设备发请求，每块盘单独一条输出，最后给汇总 */
+	function runBatch(action, force) {
+		var names = checkedNames();
+		if (!names.length) { toast("一块都没勾", "bad"); return; }
+		if (!window.confirm((action === "mount" ? "挂载" : "卸载") + " 选中的 " + names.length
+			+ " 块盘？\n" + names.join("、") + "\n\n继续吗？")) { return; }
+
+		busy(true);
+		var i = 0, ok = 0, bad = 0, failed = [];
+		(function next() {
+			if (i >= names.length) {
+				busy(false);
+				hr();
+				print("批量" + (action === "mount" ? "挂载" : "卸载") + "结束",
+					"成功 " + ok + " 块，失败 " + bad + " 块"
+					+ (failed.length ? "\n失败的：" + failed.join("、") : ""), bad === 0);
+				toast("批量完成：成功 " + ok + "，失败 " + bad, bad ? "bad" : "good");
+				load(true);
+				return;
+			}
+			var nm = names[i++];
+			var params = { target: nm };
+			if (force) { params.force = "1"; }
+			if (action === "umount") {
+				params.stop = "1";       /* 卸不掉时临时停 OpenList，卸完自动拉起 */
+			}
+			post(action, params, function (d, x) {
+				var good = d && d.ok;
+				if (good) { ok++; } else { bad++; failed.push(nm); }
+				print((action === "mount" ? "挂载 " : "卸载 ") + nm,
+					d ? (d.msg || "(无输出)") : "没有拿到结果（HTTP " + ((x && x.status) || "?") + "）",
+					good);
+				next();
+			});
+		})();
+
+		function hr() {
+			el("oa-out-hint").textContent = "批量操作";
+		}
+	}
+
+	/* ---------------------------------------------------------- 事件 */
+
+	function onClick(e) {
+		var t = e.target;
+		if (!t || !t.getAttribute) { return; }
+
+		/* ⋯ 展开 */
+		var mid = t.getAttribute("data-more");
+		if (mid) {
+			e.preventDefault();
+			var box = el(mid);
+			if (box) {
+				var open = box.classList.toggle("open");
+				t.classList.toggle("open", open);
+			}
+			return;
+		}
+
+		var fmt = t.getAttribute("data-fmt");
+		var act = t.getAttribute("data-act");
+		var dev = t.getAttribute("data-dev");
+
+		if (fmt) {
+			e.preventDefault();
+			var fsName = { exfat: "exFAT", vfat: "FAT32", ext4: "ext4" }[fmt] || fmt;
+			var ans = window.prompt(
+				"⚠️  危险操作：格式化 /dev/" + dev + " 会把上面的数据全部清空，不可恢复！\n\n"
+				+ "要把它格式化成 " + fsName + "。\n"
+				+ "确认无误请输入设备名（就这几个字符）：" + dev, "");
+			if (ans !== dev) { toast("已取消格式化"); return; }
+			runAction("format", { target: dev, fs: fmt }, "格式化 " + dev + " → " + fsName);
+			return;
+		}
+
+		if (!act) { return; }
+		e.preventDefault();
+
+		var params = { target: dev };
+		if (t.getAttribute("data-force")) { params.force = "1"; }
+		if (t.getAttribute("data-stop")) { params.stop = "1"; }
+
+		var verb = LABEL[act] || act;
+		runAction(act, params, verb + (dev ? (" " + dev) : ""));
+	}
+
+	function bind() {
+		document.addEventListener("click", onClick);
+
+		el("oa-refresh").onclick = function () { load(false); };
+
+		/* 批量面板折叠 */
+		el("oa-batch-hd").onclick = function () {
+			var b = el("oa-batch-body");
+			var open = (b.style.display === "none");
+			b.style.display = open ? "" : "none";
+			el("oa-batch-caret").classList.toggle("open", open);
+		};
+		document.addEventListener("change", function (e) {
+			var t = e.target;
+			if (!t || !t.getAttribute) { return; }
+			var nm = t.getAttribute("data-chk");
+			if (nm) { CHECKED[nm] = !!t.checked; updateBatchSum(); }
+		});
+
+		el("oa-b-mount").onclick = function () {
+			runBatch("mount", el("oa-batch-force").checked);
+		};
+		el("oa-b-umount").onclick = function () {
+			runBatch("umount", el("oa-batch-force").checked);
+		};
+		el("oa-b-all").onclick = function () {
+			mountable().forEach(function (x) { CHECKED[x.name] = true; });
+			renderBatch();
+		};
+		el("oa-b-none").onclick = function () {
+			mountable().forEach(function (x) { CHECKED[x.name] = false; });
+			renderBatch();
+		};
+
+		el("oa-ol-start").onclick = function () { runAction("openlist_start", {}, "启动 OpenList"); };
+		el("oa-ol-stop").onclick = function () { runAction("openlist_stop", {}, "停止 OpenList"); };
+
+		el("oa-tools").onclick = function () {
+			el("oa-tools-out").textContent = "正在检查…";
+			el("oa-tools-out").style.color = "";
+			post("tools", {}, function (d) {
+				el("oa-tools-out").textContent = (d && d.msg) ? d.msg : "检查失败";
+			});
+		};
+
+		el("oa-tools-install").onclick = function () {
+			if (!window.confirm("将从 OpenWrt 官方源安装这几个包：\n"
+				+ "  exfat-mkfs / exfat-fsck（exFAT 的格式化与检查）\n"
+				+ "  dosfstools（FAT32）、e2fsprogs（ext4 检查）\n"
+				+ "都是纯用户态程序，几百 KB，需要能联外网。\n\n继续吗？")) { return; }
+			el("oa-tools-out").textContent = "正在安装，可能要 1～2 分钟…";
+			busy(true);
+			post("tools_install", {}, function (d) {
+				busy(false);
+				el("oa-tools-out").textContent = (d && d.msg) ? d.msg : "安装失败";
+				toast(d && d.ok ? "工具安装完成" : "安装没成功，看输出", d && d.ok ? "good" : "bad");
+				post("tools", {}, function (d2) {
+					el("oa-tools-out").textContent = (d2 && d2.msg) ? d2.msg : "自检失败";
+				});
+			});
+		};
+
+		el("oa-clear").onclick = function () {
+			el("oa-out").innerHTML = "";
+			el("oa-out-hint").textContent = "";
+		};
+	}
+
+	if (document.readyState === "loading") {
+		document.addEventListener("DOMContentLoaded", function () { bind(); load(true); });
+	} else {
+		bind(); load(true);
+	}
+})();
+</script>
+<%+footer%>
