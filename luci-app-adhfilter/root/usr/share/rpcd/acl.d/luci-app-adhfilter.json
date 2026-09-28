@@ -1,0 +1,18 @@
+{
+    "luci-app-adhfilter": {
+        "description": "Grant access to AdhFilter (device filtering UI)",
+        "read": {
+            "uci": [ "adhfilter", "dhcp", "firewall", "network" ],
+            "file": {
+                "/tmp/dhcp.leases": [ "read" ],
+                "/usr/bin/adhfilter": [ "read", "exec" ]
+            }
+        },
+        "write": {
+            "uci": [ "adhfilter", "dhcp", "firewall" ],
+            "file": {
+                "/usr/bin/adhfilter": [ "read", "exec" ]
+            }
+        }
+    }
+}

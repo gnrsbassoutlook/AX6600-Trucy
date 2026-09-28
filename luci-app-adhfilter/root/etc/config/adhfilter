@@ -1,0 +1,2 @@
+config adhfilter 'main'
+	option enabled '1'

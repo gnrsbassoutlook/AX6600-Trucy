@@ -1,0 +1,481 @@
+<%
+-- luci-app-adhfilter 主界面（穿梭框 / transfer 布局）
+-- 左侧 = 正常上网，右侧 = 已封禁 NSFW 站点。
+-- 勾选后点中间按钮左右搬运；也可以直接双击一台设备来回搬。
+-- 这是 CBI SimpleSection 的内容片段（外层框架由 CBI 提供），
+-- 与 luci-app-oaf 的 view/oaf/dashboard.htm 是同一套机制。
+%>
+<style>
+.af {
+	--af-fg:#2b3445; --af-dim:#7b8794; --af-bg:#fff; --af-bg2:#f7f9fc;
+	--af-line:#e3e8f0; --af-brand:#5b7cfa; --af-good:#12915f;
+	--af-bad:#d93f3f; --af-warn:#c07815;
+	font-size:13px; color:var(--af-fg); line-height:1.6;
+}
+[data-darkmode="true"] .af, .dark .af {
+	--af-fg:#dbe3ee; --af-dim:#8e9bb0; --af-bg:#1f2733; --af-bg2:#242d3a;
+	--af-line:#323d4d; --af-brand:#6b8bff; --af-good:#38c98a;
+	--af-bad:#ff7070; --af-warn:#f0a93b;
+}
+.af * { box-sizing:border-box; }
+.af-busy { pointer-events:none; }
+.af-busy .af-btn { opacity:.5; }
+.af-dim { color:var(--af-dim); font-weight:400; font-size:12px; }
+
+/* ---- 顶部状态 ---- */
+.af-stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(136px,1fr)); gap:10px; margin-bottom:14px; }
+.af-st { background:var(--af-bg2); border:1px solid var(--af-line); border-radius:10px; padding:9px 12px; }
+.af-st-t { font-size:12px; color:var(--af-dim); }
+.af-st-v { font-size:16px; font-weight:600; margin-top:1px; }
+.af-st-v.good { color:var(--af-good); }
+.af-st-v.bad  { color:var(--af-bad); }
+
+.af-panel { background:var(--af-bg); border:1px solid var(--af-line); border-radius:10px; margin-bottom:14px; overflow:hidden; }
+.af-hd { display:flex; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--af-line); background:var(--af-bg2); }
+.af-title { font-weight:600; font-size:14px; }
+.af-sub { font-size:12px; color:var(--af-dim); }
+.af-spacer { flex:1; }
+.af-body { padding:14px; }
+
+/* ---- 穿梭框 ---- */
+.af-xfer { display:grid; grid-template-columns:1fr 96px 1fr; gap:12px; align-items:stretch; }
+.af-col { border:1px solid var(--af-line); border-radius:9px; overflow:hidden; display:flex; flex-direction:column;
+	background:var(--af-bg); min-height:250px; }
+.af-col-hd { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--af-bg2);
+	border-bottom:1px solid var(--af-line); font-size:13px; }
+.af-col-hd input[type=checkbox] { width:15px; height:15px; margin:0; cursor:pointer; flex:none; }
+.af-col-hd b { font-weight:600; }
+.af-col-body { flex:1; overflow-y:auto; max-height:430px; }
+
+.af-item { display:flex; align-items:center; gap:9px; padding:8px 11px; cursor:pointer;
+	border-bottom:1px solid var(--af-line); margin:0; }
+.af-item:last-child { border-bottom:none; }
+.af-item:hover { background:var(--af-bg2); }
+.af-item input[type=checkbox] { flex:none; width:15px; height:15px; margin:0; cursor:pointer; }
+.af-item-main { flex:1; min-width:0; }
+.af-item-nm { display:block; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.af-item-sub { display:block; font-size:11px; color:var(--af-dim);
+	font-family:ui-monospace,Menlo,Consolas,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+.af-mid { display:flex; flex-direction:column; justify-content:center; gap:10px; }
+.af-mid .af-btn { width:100%; padding:8px 4px; }
+
+/* ---- 通用件 ---- */
+.af-b { display:inline-block; font-size:10px; padding:1px 6px; border-radius:20px;
+	border:1px solid transparent; white-space:nowrap; flex:none; }
+.af-b-pin  { background:rgba(91,124,250,.12); color:var(--af-brand); border-color:rgba(91,124,250,.35); }
+.af-b-idle { background:rgba(192,120,21,.12); color:var(--af-warn); border-color:rgba(192,120,21,.35); }
+.af-b-rand { background:rgba(217,63,63,.12); color:var(--af-bad); border-color:rgba(217,63,63,.35); }
+
+.af-btn { font:inherit; font-size:12px; padding:5px 12px; border-radius:7px; cursor:pointer;
+	border:1px solid var(--af-line); background:var(--af-bg); color:var(--af-fg); transition:.15s; white-space:nowrap; }
+.af-btn:hover:not(:disabled) { border-color:var(--af-brand); color:var(--af-brand); }
+.af-btn:disabled { opacity:.4; cursor:default; }
+.af-primary { background:var(--af-brand); border-color:var(--af-brand); color:#fff; }
+.af-primary:hover:not(:disabled) { filter:brightness(1.1); color:#fff; }
+.af-ghost { color:var(--af-dim); }
+.af-mini { font:inherit; font-size:11px; line-height:1; padding:3px 6px; border-radius:6px; cursor:pointer;
+	border:1px solid var(--af-line); background:transparent; color:var(--af-dim); flex:none; opacity:.45; }
+.af-item:hover .af-mini { opacity:1; }
+.af-mini:hover { border-color:var(--af-brand); color:var(--af-brand); }
+
+.af-manual { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+.af-input { flex:1 1 220px; min-width:170px; font:inherit; font-size:13px; padding:7px 10px;
+	border-radius:7px; border:1px solid var(--af-line); background:var(--af-bg); color:var(--af-fg); }
+.af-input:focus { outline:none; border-color:var(--af-brand); }
+.af-tip { font-size:12px; color:var(--af-dim); margin-top:10px; }
+.af-empty { padding:26px 14px; text-align:center; color:var(--af-dim); }
+.af-pre { margin:0; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px;
+	white-space:pre-wrap; word-break:break-all; max-height:340px; overflow:auto; color:var(--af-fg); }
+.af-err { background:rgba(217,63,63,.1); border:1px solid rgba(217,63,63,.4);
+	color:var(--af-bad); padding:10px 12px; border-radius:8px; margin-bottom:12px; }
+
+.af-toast { position:fixed; left:50%; bottom:28px; transform:translate(-50%,20px); max-width:min(680px,92vw);
+	background:#2b3445; color:#fff; padding:10px 16px; border-radius:9px; font-size:13px; z-index:9999;
+	opacity:0; pointer-events:none; transition:.22s; white-space:pre-wrap; box-shadow:0 6px 24px rgba(0,0,0,.28); }
+.af-toast.show { opacity:1; transform:translate(-50%,0); }
+.af-toast.good { background:#12915f; }
+.af-toast.bad  { background:#d93f3f; }
+
+@media (max-width:760px) {
+	.af-xfer { grid-template-columns:1fr; }
+	.af-mid { flex-direction:row; }
+	.af-mid .af-btn { width:auto; flex:1; }
+	.af-col { min-height:auto; }
+	.af-col-body { max-height:240px; }
+}
+</style>
+
+<div class="af" id="af-root">
+	<div id="af-warn"></div>
+	<div class="af-stats" id="af-stats"></div>
+
+	<div class="af-panel">
+		<div class="af-hd">
+			<span class="af-title">设备过滤名单</span>
+			<span class="af-sub" id="af-sub"></span>
+			<span class="af-spacer"></span>
+			<button class="af-btn af-ghost" id="af-refresh">刷新</button>
+		</div>
+		<div class="af-body">
+			<div class="af-xfer">
+				<div class="af-col">
+					<div class="af-col-hd">
+						<input type="checkbox" id="af-all-free" title="全选">
+						<b>正常上网</b>
+						<span class="af-dim" id="af-cnt-free"></span>
+					</div>
+					<div class="af-col-body" id="af-free"></div>
+				</div>
+
+				<div class="af-mid">
+					<button class="af-btn af-primary" id="af-do-block" disabled title="把勾选的设备加入 NSFW 封禁">封禁 →</button>
+					<button class="af-btn af-ghost" id="af-do-unblock" disabled title="把勾选的设备移出封禁，恢复正常上网">← 解禁</button>
+				</div>
+
+				<div class="af-col">
+					<div class="af-col-hd">
+						<input type="checkbox" id="af-all-blk" title="全选">
+						<b>封禁 NSFW 站点</b>
+						<span class="af-dim" id="af-cnt-blk"></span>
+					</div>
+					<div class="af-col-body" id="af-blk"></div>
+				</div>
+			</div>
+
+			<div class="af-manual">
+				<input class="af-input" id="af-manual-ip" placeholder="设备不在上面？手动输入 IP，例如 192.168.1.120">
+				<button class="af-btn af-primary" id="af-manual-go">加入封禁</button>
+			</div>
+			<div class="af-tip">
+				勾选后点中间按钮搬运，或直接<b>双击</b>某一台来回搬。加入封禁时会<b>自动固定它的 IP</b>并同时绑定 MAC
+				（双保险，设备换 IP 也不会漏）。设备必须在线（连过 WiFi、拿过 IP）才能操作。
+				<br><b>搬动即刻生效</b>，无需再点页面下方的「保存 / 保存 &amp; 应用」。
+			</div>
+		</div>
+	</div>
+
+	<div class="af-panel">
+		<div class="af-hd">
+			<span class="af-title">自检</span>
+			<span class="af-spacer"></span>
+			<button class="af-btn af-ghost" id="af-check-go">运行自检</button>
+		</div>
+		<div class="af-body">
+			<pre class="af-pre" id="af-check-out">点右上角「运行自检」，检查锚点、dnsmasq、端口是否都正常。</pre>
+		</div>
+	</div>
+</div>
+
+<div class="af-toast" id="af-toast"></div>
+
+<script>
+(function () {
+	"use strict";
+
+	/* 接口基址 = 本页地址本身（形如 /cgi-bin/luci/admin/services/adhfilter）。
+	   不用模板的 url() 去拼：那条路径语义依赖 LuCI 内部实现，直接取当前地址最稳。
+	   接口是**一级扁平**挂在主页之下的（见 controller 注释），且主页节点不能带 leaf，
+	   否则 /devices 会被主页面截胡、返回整页 HTML。 */
+	var API = location.pathname.replace(/\/+$/, "");
+
+	/* 本固件的 luci-static/resources/xhr.js 有两个坑，这里一律自己解析，不指望它：
+	   ① get ：只有 Content-Type 恰好等于 "application/json" 时才 eval，否则回调第二参恒为 null；
+	   ② post：回调**只传 xhr 一个参数**，完全不解析响应体。 */
+	function jparse(x) {
+		if (!x) { return null; }
+		var txt = x.responseText || "";
+		if (!txt) { return null; }
+		try { return JSON.parse(txt); } catch (e) { return null; }
+	}
+
+	function el(id) { return document.getElementById(id); }
+
+	function esc(s) {
+		return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+			return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+		});
+	}
+
+	var toastTimer = null;
+	function toast(msg, cls) {
+		var t = el("af-toast");
+		if (!t) { return; }
+		t.textContent = msg;
+		t.className = "af-toast show" + (cls ? " " + cls : "");
+		clearTimeout(toastTimer);
+		toastTimer = setTimeout(function () { t.className = "af-toast"; }, 9000);
+	}
+
+	function busy(on) {
+		var r = el("af-root");
+		if (r) { r.classList.toggle("af-busy", !!on); }
+		document.body.style.cursor = on ? "progress" : "";
+	}
+
+	/* ---------------- 渲染 ---------------- */
+
+	function renderStats(d) {
+		var s = d.status || {};
+		var items = [
+			{ t: "AdGuard Home", v: s.adh_running ? "运行中" : "未运行", c: s.adh_running ? "good" : "bad" },
+			{ t: "过滤端口 5335", v: s.adh_port ? "监听中" : "未监听", c: s.adh_port ? "good" : "bad" },
+			{ t: "已封禁设备", v: (s.anchor_ip || 0) + " 台", c: "" },
+			{ t: "防火墙锚点", v: (s.rules_total || 0) + " 条", c: "" },
+			{ t: "本机 LAN", v: s.lan_ip || "?", c: "" }
+		];
+		var h = "";
+		for (var i = 0; i < items.length; i++) {
+			h += '<div class="af-st"><div class="af-st-t">' + esc(items[i].t) + '</div>'
+			   + '<div class="af-st-v ' + items[i].c + '">' + esc(items[i].v) + '</div></div>';
+		}
+		el("af-stats").innerHTML = h;
+
+		if (s.has_tool === false) {
+			el("af-warn").innerHTML = '<div class="af-err"><b>找不到 /usr/bin/adhfilter</b><br>'
+				+ '这个界面只是外壳，真正干活的是那个脚本。请先把它放到 /usr/bin/ 并加上可执行权限。</div>';
+		} else {
+			el("af-warn").innerHTML = "";
+		}
+	}
+
+	function itemHtml(v, side) {
+		var nm = v.bindname || v.name || "(未知设备)";
+		var sub = v.ip + (v.mac ? "  ·  " + v.mac : "");
+
+		var badges = "";
+		if (v.bound)   { badges += '<span class="af-b af-b-pin">已固定</span>'; }
+		if (!v.online) { badges += '<span class="af-b af-b-idle">离线</span>'; }
+		if (v.randmac) { badges += '<span class="af-b af-b-rand" title="这台设备开了「私有/随机 Wi-Fi 地址」。它每次连网都会换 MAC，导致 MAC 规则和静态绑定失效 → 换 IP 后就漏过滤了。建议在该设备上关掉这个开关。">随机MAC</span>'; }
+
+		return '<label class="af-item" data-ip="' + esc(v.ip) + '" data-side="' + side + '">'
+		     +   '<input type="checkbox" class="af-ck">'
+		     +   '<span class="af-item-main">'
+		     +     '<span class="af-item-nm">' + esc(nm) + '</span>'
+		     +     '<span class="af-item-sub">' + esc(sub) + '</span>'
+		     +   '</span>'
+		     +   badges
+		     +   (side === "blk"
+		            ? '<button type="button" class="af-mini" data-rename="' + esc(v.ip) + '" title="改个好认的名字">✎</button>'
+		            : '')
+		     + '</label>';
+	}
+
+	function render(d) {
+		renderStats(d);
+
+		var devs = d.devices || [];
+		var free = [], blk = [], rands = [];
+		for (var i = 0; i < devs.length; i++) {
+			(devs[i].filtered ? blk : free).push(devs[i]);
+			if (devs[i].randmac) {
+				rands.push(devs[i].bindname || devs[i].name || devs[i].ip);
+			}
+		}
+
+		if (rands.length) {
+			el("af-warn").innerHTML += '<div class="af-err">'
+				+ '<b>⚠ 检测到 ' + rands.length + ' 台设备在使用「随机 MAC」：</b>' + esc(rands.join("、"))
+				+ '<br>它们（iOS 的「私有 Wi-Fi 地址」/ 安卓的「随机 MAC」）每次连网都会换 MAC，'
+				+ '会让 MAC 规则和静态绑定失效 —— 一旦它们换了 IP，就<b>漏过滤</b>了。'
+				+ '请在设备上关掉这个开关（iOS：设置 → Wi-Fi → 点 ⓘ → 关掉「私有 Wi-Fi 地址」）之后再加入名单。</div>';
+		}
+
+		var hf = "", hb = "";
+		for (i = 0; i < free.length; i++) { hf += itemHtml(free[i], "free"); }
+		for (i = 0; i < blk.length;  i++) { hb += itemHtml(blk[i],  "blk"); }
+
+		el("af-free").innerHTML = hf || '<div class="af-empty">没有未过滤的设备</div>';
+		el("af-blk").innerHTML  = hb || '<div class="af-empty">还没有封禁任何设备</div>';
+		el("af-cnt-free").textContent = free.length + " 台";
+		el("af-cnt-blk").textContent  = blk.length + " 台";
+		el("af-sub").textContent = "共发现 " + devs.length + " 台设备";
+
+		// 手动输入的示例 IP 跟着本机网段走（主机 192.168.1.x / 副机 192.168.3.x）
+		var st = d.status || {};
+		var inp = el("af-manual-ip");
+		if (inp && st.lan_ip) {
+			inp.placeholder = "设备不在上面？手动输入 IP，例如 "
+				+ String(st.lan_ip).replace(/\.\d+$/, ".120");
+		}
+
+		el("af-all-free").checked = false;
+		el("af-all-blk").checked  = false;
+		updateBtns();
+	}
+
+	/* ---------------- 选择 ---------------- */
+
+	function boxes(side) {
+		return document.querySelectorAll('.af-item[data-side="' + side + '"] .af-ck');
+	}
+
+	function selected(side) {
+		var bs = boxes(side), out = [];
+		for (var i = 0; i < bs.length; i++) {
+			if (bs[i].checked) {
+				out.push(bs[i].closest(".af-item").getAttribute("data-ip"));
+			}
+		}
+		return out;
+	}
+
+	function updateBtns() {
+		el("af-do-block").disabled   = selected("free").length === 0;
+		el("af-do-unblock").disabled = selected("blk").length  === 0;
+	}
+
+	/* ---------------- 通信 ---------------- */
+
+	function load() {
+		new XHR().get(API + "/devices", null, function (x, d) {
+			d = d || jparse(x);
+			if (!d || !d.devices) {
+				toast("读取设备列表失败（HTTP " + ((x && x.status) || "?") + "）"
+					+ "。若页面能开但一直空表，多半是接口被路由层拦了 —— 请刷新一次；仍不行就把这个提示发我。", "bad");
+				return;
+			}
+			render(d);
+		});
+	}
+
+	function runSeq(ips, act, label) {
+		if (!ips.length) { return; }
+
+		var i = 0, okN = 0, bad = [];
+		busy(true);
+
+		function step() {
+			if (i >= ips.length) {
+				busy(false);
+				if (bad.length) {
+					toast(label + "完成 " + okN + "/" + ips.length + " 台，失败：" + bad.join(", "), "bad");
+				} else {
+					toast(label + "成功，共 " + okN + " 台", "good");
+				}
+				load();
+				return;
+			}
+			var ip = ips[i++];
+			toast(label + "中 " + i + "/" + ips.length + "：" + ip
+				+ "（每台约 5～15 秒，正在重启 dnsmasq，请勿关闭页面）", "");
+
+			new XHR().post(API + "/action", { action: act, target: ip }, function (x) {
+				var d = jparse(x);
+				if (d && d.ok) { okN++; }
+				else {
+					bad.push(ip + "：" + ((d && d.msg)
+						? String(d.msg).replace(/\s+/g, " ").slice(0, 60)
+						: ("HTTP " + ((x && x.status) || "?"))));
+				}
+				step();
+			});
+		}
+		step();
+	}
+
+	function rename(ip) {
+		var nn = window.prompt("给 " + ip + " 起个名字\n（只能用 字母/数字/下划线/连字符；中文会让 dnsmasq 崩溃 → 全屋断网）", "");
+		if (nn === null) { return; }
+		nn = String(nn).trim();
+		if (!nn) { return; }
+		if (!/^[A-Za-z0-9_-]{1,20}$/.test(nn)) {
+			toast("名字不合法：只能用 字母/数字/下划线/连字符，1～20 个字符", "bad");
+			return;
+		}
+		busy(true);
+		toast("改名中…（要重启 dnsmasq，约 5～15 秒）", "");
+		new XHR().post(API + "/action", { action: "rename", target: ip, newname: nn }, function (x) {
+			var d = jparse(x);
+			busy(false);
+			if (d) { toast((d.ok ? "✔ " : "✘ ") + String(d.msg || "").trim(), d.ok ? "good" : "bad"); }
+			else  { toast("改名失败（HTTP " + ((x && x.status) || "?") + "）", "bad"); }
+			load();
+		});
+	}
+
+	/* ---------------- 事件（绑到 document，只绑一次） ---------------- */
+
+	if (!window.__af_bound) {
+		window.__af_bound = true;
+
+		document.addEventListener("change", function (e) {
+			var t = e.target;
+			if (!t) { return; }
+			if (t.classList && t.classList.contains("af-ck")) { updateBtns(); return; }
+
+			if (t.id === "af-all-free" || t.id === "af-all-blk") {
+				var side = (t.id === "af-all-free") ? "free" : "blk";
+				var bs = boxes(side);
+				for (var i = 0; i < bs.length; i++) { bs[i].checked = t.checked; }
+				updateBtns();
+			}
+		});
+
+		document.addEventListener("click", function (e) {
+			var t = e.target;
+			if (!t || !t.closest) { return; }
+			var b = t.closest("[data-rename]");
+			if (!b) { return; }
+			e.preventDefault();
+			e.stopPropagation();
+			rename(b.getAttribute("data-rename"));
+		});
+
+		document.addEventListener("dblclick", function (e) {
+			var t = e.target;
+			if (!t || !t.closest) { return; }
+			if (t.closest("button")) { return; }
+			var item = t.closest(".af-item");
+			if (!item) { return; }
+
+			var ip   = item.getAttribute("data-ip");
+			var side = item.getAttribute("data-side");
+			if (side === "free") { runSeq([ip], "block",   "封禁"); }
+			else                 { runSeq([ip], "unblock", "解禁"); }
+		});
+	}
+
+	el("af-refresh").onclick  = function () { load(); };
+
+	el("af-do-block").onclick = function () {
+		var ips = selected("free");
+		if (!ips.length) { return; }
+		/* 不弹确认框：点一下直接把设备送进右边并立即生效。
+		   底部的「保存 / 保存 & 应用」是 LuCI 的通用页脚，本页没有可保存的字段，
+		   对这里不起作用，也不需要点。 */
+		runSeq(ips, "block", "封禁");
+	};
+
+	el("af-do-unblock").onclick = function () {
+		var ips = selected("blk");
+		if (!ips.length) { return; }
+		runSeq(ips, "unblock", "解禁");
+	};
+
+	el("af-check-go").onclick = function () {
+		el("af-check-out").textContent = "运行中…";
+		new XHR().get(API + "/check", null, function (x, d) {
+			d = d || jparse(x);
+			el("af-check-out").textContent = (d && d.text) ? d.text
+				: ("自检失败（HTTP " + ((x && x.status) || "?") + "）");
+		});
+	};
+
+	el("af-manual-go").onclick = function () {
+		var ip = el("af-manual-ip").value.trim();
+		if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
+			toast("IP 格式不对，应该像 192.168.1.120", "bad");
+			return;
+		}
+		runSeq([ip], "block", "封禁");
+		el("af-manual-ip").value = "";
+	};
+
+	el("af-manual-ip").addEventListener("keydown", function (e) {
+		if (e.key === "Enter") { el("af-manual-go").click(); }
+	});
+
+	load();
+})();
+</script>

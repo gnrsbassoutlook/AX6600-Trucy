@@ -1,0 +1,18 @@
+# macOS 垃圾
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# 打包过程中的中转文件（git bundle 是运输用的，仓库里不需要）
+*.bundle
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc

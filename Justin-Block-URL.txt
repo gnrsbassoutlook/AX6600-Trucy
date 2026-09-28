@@ -1,5 +1,0 @@
-||bilibili.com^$client='Justin_iPhone'
-||iqiyi.com^$client='Justin_iPhone'
-||weibo.com^$client='Justin_iPhone'
-||zhihu.com^$client='Justin_iPhone'
-||163.com^$client='Justin_iPhone'

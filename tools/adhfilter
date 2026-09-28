@@ -1,0 +1,390 @@
+#!/bin/sh
+# adhfilter v7 - 按设备管理哪些设备走 AdGuard Home 色情过滤
+# 每台设备 = 两条规则: 按 IP + 按 MAC (双锚, 任一锚失效另一锚仍生效)
+#
+#   adhfilter devices               列出设备(IP/名字/MAC/是否过滤/是否在线)
+#   adhfilter list                  列出被过滤的设备及两条锚的状态
+#   adhfilter bind   <IP|名>         绑定固定 IP (必须做, 不等于加入过滤)
+#   adhfilter rename <IP|名> <新名>   给设备改个好认的名字(建议纯英文)
+#   adhfilter add    <IP|名>         加入色情过滤
+#   adhfilter del    <IP|名>         移出过滤(规则+静态绑定一起删)
+#   adhfilter resync <IP|名>         按当前状态刷新锚点(设备换 MAC 后用)
+#   adhfilter check                 五项自检(含 dnsmasq 存活检测)
+#
+# v7 相对 v6:
+#   - 锚点校验不再依赖 fw3 注释里的段名(改过名/迁移过也不会误报),
+#     改为直接匹配 iptables 里的 -s <IP>/32 与 --mac-source <MAC>
+#   - devices 同时认 IP 锚和 MAC 锚(以前设备换了 IP 会误显示"否")
+#   - resync 只清理目标设备自己的锚, 不再误删其他设备的 MAC 锚
+#   - mac_of 增加第三来源: 静态绑定里的 MAC
+
+LEASES=/tmp/dhcp.leases
+# 本机 LAN 地址：动态读取，让同一份脚本在任意一台路由器上都能用。
+# （静态锚的 DNAT dest_ip 必须指向本机；写死会在别的网段上把 DNS 转到错误的机器）
+SELF=$(uci -q get network.lan.ipaddr 2>/dev/null)
+[ -z "$SELF" ] && SELF=192.168.1.1
+ADHPORT=5335
+PIP=KidADH
+PMAC=KidADHM
+
+sec_ip()  { echo "${PIP}_$(echo "$1" | tr . _)"; }
+sec_mac() { echo "${PMAC}_$(echo "$1" | tr : _)"; }
+hosts()   { uci show dhcp 2>/dev/null | grep "=host" | cut -d. -f2 | cut -d= -f1 | grep "^KidHost_"; }
+
+bindname_of() { uci -q get dhcp.KidHost_$(echo "$1" | tr . _).name 2>/dev/null; }
+bindmac_of()  { uci -q get dhcp.KidHost_$(echo "$1" | tr . _).mac 2>/dev/null; }
+
+# 按 MAC 找静态绑定段名
+bound_sec_by_mac() {
+  for H in $(hosts); do
+    [ "$(uci -q get dhcp.$H.mac)" = "$1" ] && { echo "$H"; return 0; }
+  done
+  return 1
+}
+
+# resolve 返回: 0=唯一命中(echo IP) 2=名字撞车(多台同名) 1=找不到
+resolve() {
+  case "$1" in
+    192.168.*) echo "$1"; return 0 ;;
+  esac
+  WANT=$(echo "$1" | tr A-Z a-z); FOUND=""; CNT=0
+  while read -r TS M I N D; do
+    [ -z "$I" ] && continue
+    M1=$(echo "$N" | tr A-Z a-z)
+    M2=$(echo "$(bindname_of "$I")" | tr A-Z a-z)
+    if [ "$M1" = "$WANT" ] || [ "$M2" = "$WANT" ]; then
+      FOUND="$I"; CNT=$((CNT + 1))
+    fi
+  done < "$LEASES"
+  [ "$CNT" = "0" ] && return 1
+  [ "$CNT" -gt 1 ] && return 2
+  echo "$FOUND"
+}
+
+res() {
+  R=$(resolve "$1"); RC=$?
+  case "$RC" in
+    0) echo "$R" ;;
+    2) echo "!! 名字 \"$1\" 同时匹配多台设备, 请改用 IP (跑 adhfilter devices 看 IP)" >&2; return 1 ;;
+    *) echo "!! 找不到设备: $1 (先跑 adhfilter devices)" >&2; return 1 ;;
+  esac
+}
+
+# MAC 三来源: ① DHCP 租约 ② 邻居表(ARP) ③ 静态绑定
+mac_of() {
+  FOUND=""
+  while read -r TS M I N D; do [ "$I" = "$1" ] && FOUND="$M"; done < "$LEASES"
+  if [ -z "$FOUND" ]; then
+    FOUND=$(ip neigh show "$1" 2>/dev/null | awk "{print \$5}")
+  fi
+  case "$FOUND" in
+    ??:??:??:??:??:??) : ;;
+    *) FOUND="$(bindmac_of "$1")" ;;
+  esac
+  case "$FOUND" in
+    *[!0-9a-fA-F:]*|"") FOUND="" ;;
+    ??:??:??:??:??:??) : ;;
+    *) FOUND="" ;;
+  esac
+  echo "$FOUND"
+}
+
+name_of() {
+  FOUND=""
+  while read -r TS M I N D; do [ "$I" = "$1" ] && FOUND="$N"; done < "$LEASES"
+  [ -z "$FOUND" ] && FOUND="(未知)"
+  echo "$FOUND"
+}
+
+# 按 MAC 查它现在拿到的 IP (可能和静态绑定的 IP 不同)
+cur_ip_of() {
+  FOUND=""
+  while read -r TS M I N D; do [ "$M" = "$1" ] && FOUND="$I"; done < "$LEASES"
+  echo "$FOUND"
+}
+
+# 设备显示名: 优先用你起的名字
+disp_of() {
+  BN=$(bindname_of "$1")
+  [ -n "$BN" ] && { echo "$BN"; return 0; }
+  name_of "$1"
+}
+
+# 写入 dhcp-host 的名字必须是合法主机名, 否则 dnsmasq 拒绝启动(崩溃循环)
+safe_name() {
+  N=$(echo "$1" | tr -cd "A-Za-z0-9_-")
+  [ -z "$N" ] && N=device
+  echo "$N" | cut -c1-20
+}
+
+online() { ip neigh show "$1" 2>/dev/null | grep -q -v FAILED && echo 1 || echo 0; }
+
+dns_ok() {
+  j=0
+  while [ $j -lt 12 ]; do
+    CHK=$(nslookup localhost 127.0.0.1 2>&1)
+    case "$CHK" in
+      *refused*|*"no servers could be reached"*) sleep 1; j=$((j + 1)); continue ;;
+    esac
+    return 0
+  done
+  return 1
+}
+
+ips()  { uci show firewall 2>/dev/null | grep "=redirect" | cut -d. -f2 | cut -d= -f1 | grep "^${PIP}_"; }
+macs() { uci show firewall 2>/dev/null | grep "=redirect" | cut -d. -f2 | cut -d= -f1 | grep "^${PMAC}_"; }
+
+# ★ 锚点校验: 直接看 iptables 里的实际内容, 不看注释名
+nat_ip_ok()  { iptables -t nat -S 2>/dev/null | grep -- "-s $1/32"      | grep -q -- "--dport 53"; }
+nat_mac_ok() { iptables -t nat -S 2>/dev/null | grep -- "--mac-source $1" | grep -q -- "--dport 53"; }
+has_sec()    { uci -q get firewall.$1 > /dev/null 2>&1; }
+
+mkrule() {
+  S=$1; K=$2; V=$3
+  uci set firewall.$S=redirect
+  uci set firewall.$S.name="$S"
+  uci set firewall.$S.src=lan
+  uci set firewall.$S.$K="$V"
+  uci set firewall.$S.proto="tcp udp"
+  uci set firewall.$S.src_dport=53
+  uci set firewall.$S.dest_ip=$SELF
+  uci set firewall.$S.dest_port=$ADHPORT
+  uci set firewall.$S.target=DNAT
+  uci set firewall.$S.enabled=1
+  uci commit firewall
+  uci reorder firewall.$S=0
+}
+
+# 校验锚点是否真的落进 iptables; 重试最多 15 秒 (fw3 reload 有延迟)
+verify() {
+  i=0
+  while [ $i -lt 15 ]; do
+    OK=1
+    nat_ip_ok "$2" || OK=0
+    [ -n "$3" ] && { nat_mac_ok "$4" || OK=0; }
+    [ "$OK" = "1" ] && return 0
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+cmd_devices() {
+  printf "%-16s %-24s %-18s %s\n" IP 名字 MAC 是否过滤
+  while read -r TS M I N D; do
+    [ -z "$I" ] && continue
+    BN=$(bindname_of "$I")
+    if [ -n "$BN" ]; then
+      NM="$BN"
+      [ "$BN" != "$N" ] && NM="$BN*"
+    else
+      NM="$N"
+    fi
+    F=否
+    has_sec "$(sec_ip "$I")" && F=是
+    if [ "$F" = "否" ] && [ -n "$M" ] && has_sec "$(sec_mac "$M")"; then
+      F="是(MAC锚)"
+    fi
+    [ "$(online "$I")" = "0" ] && F="${F}(离线)"
+    printf "%-16s %-24s %-18s %s\n" "$I" "$NM" "$M" "$F"
+  done < "$LEASES"
+  echo "-- 带 * 表示: 你起的名字与设备自报的名字不同(不影响过滤)"
+  echo "-- 是(MAC锚) 表示: 靠 MAC 拦着, 说明它现在用的 IP 和绑定的 IP 不一样"
+}
+
+cmd_list() {
+  printf "%-16s %-18s %-14s %s\n" 锚定IP 名字 当前IP 锚点状态
+  for S in $(ips); do
+    IP=$(uci -q get firewall.$S.src_ip)
+    M=$(mac_of "$IP")
+    MS=""
+    [ -n "$M" ] && MS=$(sec_mac "$M")
+    CUR="-"
+    [ -n "$M" ] && { T=$(cur_ip_of "$M"); [ -n "$T" ] && CUR="$T"; }
+    ST="IP:OK"
+    nat_ip_ok "$IP" || ST="IP:BAD"
+    if [ -n "$MS" ]; then
+      if has_sec "$MS"; then
+        if nat_mac_ok "$M"; then ST="$ST MAC:OK"; else ST="$ST MAC:BAD"; fi
+      else
+        ST="$ST MAC:无"
+      fi
+    else
+      ST="$ST MAC:无"
+    fi
+    printf "%-16s %-18s %-14s %s\n" "$IP" "$(disp_of "$IP")" "$CUR" "$ST"
+  done
+}
+
+cmd_bind() {
+  [ -z "$1" ] && { echo "用法: adhfilter bind <IP|设备名>"; exit 1; }
+  IP=$(res "$1") || exit 1
+  MAC=$(mac_of "$IP")
+  SAFE=$(safe_name "$(disp_of $IP)")
+  [ -z "$MAC" ] && { echo "拿不到 $IP 的 MAC: 设备不在线且无租约"; exit 1; }
+  H="KidHost_$(echo $IP | tr . _)"
+  uci set dhcp.$H=host
+  uci set dhcp.$H.name="$SAFE"
+  uci set dhcp.$H.mac="$MAC"
+  uci set dhcp.$H.ip="$IP"
+  uci commit dhcp
+  /etc/init.d/dnsmasq restart > /dev/null 2>&1
+  sleep 4
+  if ! dns_ok; then
+    echo "!! dnsmasq 未能启动, 正在回滚该绑定..."
+    uci -q delete dhcp.$H
+    uci commit dhcp
+    /etc/init.d/dnsmasq restart > /dev/null 2>&1
+    sleep 3
+    echo "已回滚, 绑定未写入。名字=$SAFE  MAC=$MAC"
+    exit 1
+  fi
+  echo "OK  $IP ($SAFE) 已绑定固定 IP   MAC=$MAC"
+}
+
+cmd_rename() {
+  { [ -z "$1" ] || [ -z "$2" ]; } && { echo "用法: adhfilter rename <IP|设备名> <新名>"; exit 1; }
+  IP=$(res "$1") || exit 1
+  NEW=$(safe_name "$2")
+  H="KidHost_$(echo $IP | tr . _)"
+  uci -q get dhcp.$H > /dev/null 2>&1 || { echo "!! $IP 还没有静态绑定, 请先跑: adhfilter bind $IP"; exit 1; }
+  OLD=$(uci -q get dhcp.$H.name)
+  SRC=$(name_of "$IP")
+  case "$H" in
+    *..*|*/*) echo "!! 段名异常"; exit 1 ;;
+  esac
+  cp /etc/config/dhcp /root/dhcp.bak.rename 2>/dev/null
+  uci set dhcp.$H.name="$NEW"
+  uci commit dhcp
+  /etc/init.d/dnsmasq restart > /dev/null 2>&1
+  sleep 4
+  if ! dns_ok; then
+    echo "!! dnsmasq 未能启动, 正在回滚名字..."
+    uci set dhcp.$H.name="$OLD"
+    uci commit dhcp
+    /etc/init.d/dnsmasq restart > /dev/null 2>&1
+    sleep 3
+    echo "已回滚为 $OLD"
+    exit 1
+  fi
+  echo "OK  $IP  名字: $OLD -> $NEW"
+  if [ "$NEW" != "$2" ]; then
+    echo "    注意: 名称已规范化为合法主机名(只保留字母/数字/下划线/连字符)"
+    echo "    中文、空格、括号都不能写进这里, 否则 dnsmasq 会崩溃"
+  fi
+  echo "    (设备自己上报的名字原本是 $SRC, 路由器侧已用你的名字覆盖)"
+}
+
+cmd_add() {
+  [ -z "$1" ] && { echo "用法: adhfilter add <IP|设备名>"; exit 1; }
+  IP=$(res "$1") || exit 1
+  MAC=$(mac_of "$IP")
+  SI=$(sec_ip "$IP")
+  mkrule "$SI" src_ip "$IP"
+  SM=""
+  if [ -n "$MAC" ]; then SM=$(sec_mac "$MAC"); mkrule "$SM" src_mac "$MAC"; fi
+  uci commit firewall
+  /etc/init.d/firewall reload > /dev/null 2>&1
+  if verify "$SI" "$IP" "$SM" "$MAC"; then
+    echo "OK  $IP ($(disp_of $IP)) 已加入 ADH 色情过滤"
+    echo "    IP锚=$SI"
+    if [ -n "$SM" ]; then
+      echo "    MAC锚=$SM  ($MAC)"
+    else
+      echo "    提示: 未拿到 MAC, 只建了 IP 锚 (设备换 IP 会失效)"
+    fi
+  else
+    echo "失败! 规则锚点丢失, 请跑 adhfilter check"
+    exit 1
+  fi
+}
+
+cmd_del() {
+  [ -z "$1" ] && { echo "用法: adhfilter del <IP|设备名>"; exit 1; }
+  IP=$(res "$1") || IP="$1"
+  MAC=$(mac_of "$IP")
+  uci -q delete firewall.$(sec_ip "$IP")
+  [ -n "$MAC" ] && uci -q delete firewall.$(sec_mac "$MAC")
+  uci -q delete dhcp.KidHost_$(echo $IP | tr . _)
+  uci commit firewall
+  uci commit dhcp
+  /etc/init.d/firewall reload > /dev/null 2>&1
+  /etc/init.d/dnsmasq restart > /dev/null 2>&1
+  echo "OK  $IP 已移出过滤(规则+静态绑定均已删除)"
+}
+
+# 只清理目标设备自己的锚, 不碰其他设备
+cmd_resync() {
+  [ -z "$1" ] && { echo "用法: adhfilter resync <IP|设备名>"; exit 1; }
+  IP=$(res "$1") || exit 1
+  CURMAC=$(mac_of "$IP")          # 当前 MAC(可能是新换的)
+  BNDMAC=$(bindmac_of "$IP")      # 老绑定里的 MAC
+  uci -q delete firewall.$(sec_ip "$IP")
+  for H in $(hosts); do
+    BIP=$(uci -q get dhcp.$H.ip)
+    [ -n "$BIP" ] && uci -q delete firewall.$(sec_ip "$BIP")
+  done
+  [ -n "$CURMAC" ] && uci -q delete firewall.$(sec_mac "$CURMAC")
+  [ -n "$BNDMAC" ] && uci -q delete firewall.$(sec_mac "$BNDMAC")
+  uci commit firewall
+  cmd_add "$IP"
+}
+
+cmd_check() {
+  BAD=0
+  echo "--- IP 锚 ---"
+  for S in $(ips); do
+    IP=$(uci -q get firewall.$S.src_ip)
+    if nat_ip_ok "$IP"; then
+      echo "OK   $IP  ($(disp_of $IP))"
+    else
+      echo "BAD  $IP  IP锚丢失! 跑 adhfilter resync $IP"
+      BAD=1
+    fi
+  done
+  echo "--- MAC 锚 ---"
+  for S in $(macs); do
+    M=$(uci -q get firewall.$S.src_mac)
+    if nat_mac_ok "$M"; then
+      echo "OK   $M"
+    else
+      echo "BAD  $M  MAC锚丢失!"
+      BAD=1
+    fi
+  done
+  echo "--- dnsmasq 是否在服务(未列名单设备靠它) ---"
+  if dns_ok; then
+    echo "OK   53 端口正常应答"
+  else
+    echo "BAD  dnsmasq 未在服务! 未列名单的设备将完全无法解析域名"
+    BAD=1
+  fi
+  echo "--- dnsmasq 是否已摘除 ADH 指向(应为空) ---"
+  uci show dhcp | grep "127.0.0.1#5335" || echo "OK 已摘除(非名单设备默认放行)"
+  echo "--- dnsmasq resolvfile 路径(必须指向存在的文件) ---"
+  RV=$(uci -q get dhcp.@dnsmasq[0].resolvfile)
+  if [ -z "$RV" ]; then
+    echo "OK 未覆盖(用固件默认 /tmp/resolv.conf.d/resolv.conf.auto)"
+  elif [ -f "$RV" ]; then
+    echo "OK $RV 存在"
+  else
+    echo "BAD resolvfile=$RV 不存在! dnsmasq 会没有上游 → 全屋 REFUSED"
+    echo "    修复: uci -q delete dhcp.@dnsmasq[0].resolvfile; uci commit dhcp; /etc/init.d/dnsmasq restart"
+    BAD=1
+  fi
+  echo "--- ADH 5335 ---"
+  netstat -ln 2>/dev/null | grep -q ":5335" && echo "OK 监听中" || echo "BAD 未监听"
+  [ "$BAD" = "0" ] && echo "== 全部正常 ==" || echo "== 有异常, 见上 =="
+}
+
+case "$1" in
+  devices) cmd_devices ;;
+  list)    cmd_list ;;
+  bind)    cmd_bind "$2" ;;
+  rename)  cmd_rename "$2" "$3" ;;
+  add)     cmd_add "$2" ;;
+  del)     cmd_del "$2" ;;
+  resync)  cmd_resync "$2" ;;
+  check)   cmd_check ;;
+  *) echo "用法: adhfilter {devices|list|bind|rename|add|del|resync|check} <IP|设备名>" ;;
+esac
