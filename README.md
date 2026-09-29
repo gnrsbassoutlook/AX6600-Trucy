@@ -86,6 +86,21 @@ AX6600-Trucy/
 「**OpenList**」面板里能看到全部存储（挂载路径 / 实际根路径 / 驱动 / 状态），
 也能一键**启动 / 停止 OpenList**、打开它的 Web 面板。刷新时一起更新。
 
+#### 换盘了？点「改指向…」（v1.2.0 新增）
+
+OpenList 的存储存的是**路径**（例如 `/mnt/sda2`），不认设备名也不认 UUID。
+所以换盘、换 USB 口、盘符从 `sda` 变成 `sdb` 之后，旧指向就会失效 ——
+网页上那个目录变成打不开的「根路径未挂载」。
+
+存储表每行右边多了 **「改指向…」**（*路径没挂上时自动变成醒目的主按钮），
+面板头多了 **「新建存储」**。点开是一个**动态列表**：列出当前真实存在的每一块盘
+（设备名 / 挂载点 / 文件系统 / 容量），没挂载的置灰并提示先挂上，
+**内置 eMMC 也在列表里**（带「内置 eMMC」标签，挂到 `/mnt/emmc`）。
+
+> **为什么不做成「分区号 1~9 下拉」**：扩展分区盘的号不连续（`sda1` + `sda5`，
+> 中间的 `2/3/4` 是空的）；换个 USB 口盘符会从 `sda` 变 `sdb`（选单里没有 "b"）；
+> 小 U 盘压根没有分区表，设备名就是 `sda` 本身。**动态列真盘**这些情况全覆盖。
+
 ### 内置存储
 
 路由器自己那颗 128G eMMC 里的**空白数据分区**单独一个面板，默认未挂载，
@@ -111,8 +126,8 @@ AX6600-Trucy/
 
 ```sh
 # 方式一：ipk（推荐）
-opkg install luci-app-openlist-assist_1.1.3-1_all.ipk
-opkg install --force-depends luci-app-openlist-assist_1.1.3-1_all.ipk   # 依赖对不上时
+opkg install luci-app-openlist-assist_1.2.0-1_all.ipk
+opkg install --force-depends luci-app-openlist-assist_1.2.0-1_all.ipk   # 依赖对不上时
 
 # 方式二：源码直接铺文件（不依赖 opkg）
 cd luci-app-openlist-assist && sh install.sh
@@ -240,12 +255,13 @@ WebDAV，断电自动挂回来），配 `docs/OpenList-4T硬盘挂载-操作说�
 
 | 文档 | 讲什么 |
 |---|---|
-| `OpenList助手-界面与联动说明.md` | **插件一的完整说明书**：开关语义、批量范围、OpenList 联动、内置 eMMC、安全边界、格式矩阵 |
+| `OpenList助手-界面与联动说明.md` | **插件一的完整说明书**：开关语义、批量范围、OpenList 联动、**换盘改指向**、内置 eMMC、安全边界、格式矩阵、部署回滚 |
 | `OpenList-4T硬盘挂载-操作说明.md` | 把 4T 实体盘挂进 OpenList（含 WebDAV、热插拔、开机自动挂） |
 | `ADH按IP控制-防火墙规则速查.md` | 双锚规则的速查表 |
 | `副路由器192.168.3.1-ADH过滤操作说明.md` | 在另一台机器上从零配过滤（含五个坑） |
 | `孩子设备过滤-自己动手操作手册.md` | 手工操作版 |
 | `改LAN网段-影响清单与操作步骤.md` | 换 LAN 网段会影响什么、ADH 要不要动 |
+| `副机搬单位-改LAN与注意事项.md` | 副机搬去别的网络：改 LAN 只需 2 处、**单位网段撞段预检**、Tailscale 合规、换盘后 OpenList 认盘规律 |
 | `新主机192.168.1.1-迁移与修复记录.md` | 主机迁移记录 |
 | `OAF界面空白-修复记录.md` | OpenAppFilter 页面白屏的真根因与修法 |
 | `AX6600从机192.168.3.1配置报告.md` | **从机交付报告**：源对齐、OpenList + iStore、ADH/OAF 分工策划、iPhone 专项调优、过滤库扩容到 93 万条、回滚清单 |

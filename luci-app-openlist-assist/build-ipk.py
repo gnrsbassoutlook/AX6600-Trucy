@@ -52,7 +52,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.join(HERE, "root")
 
 PKG_NAME = "luci-app-openlist-assist"
-PKG_VERSION = "1.1.3"
+PKG_VERSION = "1.2.0"
 PKG_RELEASE = "1"
 PKG_ARCH = "all"
 PKG_LICENSE = "MIT"

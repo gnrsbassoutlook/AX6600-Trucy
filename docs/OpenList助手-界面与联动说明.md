@@ -1,12 +1,12 @@
-# OpenList 助手（luci-app-openlist-assist v1.1.3）—— 界面与联动说明
+# OpenList 助手（luci-app-openlist-assist v1.2.0）—— 界面与联动说明
 
-> 主机 `192.168.1.1` / 副机 `192.168.3.1`（AX6600 · bleachwrt · 内核 6.12.93）· 2026-09-29
+> 主机 `192.168.1.1` / 副机 `192.168.3.1`（AX6600 · bleachwrt · 内核 6.12.93）· 2026-09-30
 >
 > 入口：**LuCI → 服务 → OpenList 助手**（排在「ADH设备过滤助手」后面）
 
 ---
 
-## 一、这一版改了什么（v1.0.0 → v1.1.3）
+## 一、这一版改了什么（v1.0.0 → v1.2.0）
 
 | 改动 | 说明 |
 |---|---|
@@ -21,6 +21,7 @@
 | **v1.1.1：修 `diskctl list` 的树形归属** | 老版"见到分区就往上一行底下缩进"，会把 `mmcblk0p27` 画到 `/dev/sda` 底下，看着像 4T 盘的分区。现在**真的按 `parent` 配对**，父盘不在清单里的分区单独列一段 |
 | **v1.1.2：跟着 OpenList 存储改名同步** | 存储 `/我的4T硬盘` 改成了 `/THW-4T`（在 OpenList 面板里改的）。代码里的注释样例、本说明与 `OpenList-4T硬盘挂载-操作说明.md` 一起对齐。**无功能改动** —— 联动是按 `root`（`/mnt/sda2`）认盘的，改名不影响 |
 | **v1.1.3：状态条区分「整盘」和「分区」** | 老版把两者混在一起数，插一个 4 盘位硬盘柜会显示成「**USB 盘 8**」，看着像插了 8 块盘。现在拆成「**N 块 · M 分区**」，见 §11 |
+| **v1.2.0：存储能一键「改指向」/「新建」** | 换盘、换 USB 口、盘符从 `sda` 变 `sdb`，旧指向就失效（网页上那个目录变成打不开的「根路径未挂载」）。现在存储表**每行一个「改指向…」**、面板头一个**「新建存储」**，弹出的是**当前真实存在的盘**列表（内置 eMMC 也在里面）。见 §4.4 |
 
 ---
 
@@ -131,6 +132,58 @@ diskctl olstorages | jq .
 
 读不到时（OpenList 没跑 / 没有 token 项）会返回 `{"ok":false,"err":"..."}`，
 界面照常渲染，只是 OpenList 板块显示一条黄色提示 —— **不影响挂载卸载**。
+
+### 4.4 ⭐ v1.2.0：换盘了怎么办 —— 「改指向…」
+
+**问题**：OpenList 的存储配置里存的是**一条路径**（比如 `/mnt/sda2`），
+既不是设备名也不是 UUID。而这台机器上 USB 盘的挂载点是 `/mnt/<分区名>`，
+分区名又随**插的顺序和 USB 口**变：
+
+```
+单分区 U 盘 → /dev/sda1 → /mnt/sda1
+4T 硬盘（有保留分区）→ /dev/sda2 → /mnt/sda2
+换个 USB 口 → 盘符变 sdb → /mnt/sdb1 ← 旧指向立刻失效
+```
+
+一旦路径对不上，OpenList 网页上那个目录就打不开，本页会亮红字
+「**根路径未挂载**」。以前只能自己去 OpenList 网页上改路径。
+
+**现在**：存储表每行右边多了 **「改指向…」**（*路径没挂上时它自动变成醒目的主按钮，
+一眼就知道该点哪儿*），面板头多了 **「新建存储」**。点开弹出选择器，列出：
+
+| 列 | 内容 |
+|---|---|
+| 设备名 | `sda1` / `mmcblk0p27` … |
+| 挂载点 | `/mnt/sda1` … |
+| 文件系统 / 容量 | `exfat` · `1.8G` … |
+| 标签 | 内置 eMMC 会标「**内置 eMMC**」 |
+
+**没挂载的盘置灰**并提示"先把它挂上"—— 因为改指向要读当前挂载点，
+盘都没挂就无从谈起。**内置 eMMC 也在列表里**（挂到 `/mnt/emmc`）。
+
+#### 为什么不是「分区号 1~9 下拉」
+
+| 情况 | 固定 1~9 会怎样 |
+|---|---|
+| 扩展分区盘（`sda1` + `sda5`） | 2 / 3 / 4 是空的 |
+| 换 USB 口 → `sda` 变 `sdb` | 选单里**没有 "b"** |
+| 小 U 盘无分区表，设备名就是 `sda` | 没有数字可选 |
+
+所以改成**动态列出当前真实存在的盘** —— 插什么就出现什么，三种情况全覆盖。
+
+#### 命令行等价
+
+```sh
+diskctl olmap <存储id> <设备名>     # 改指向：把存储 <id> 的根路径改成该盘现在的挂载点
+diskctl olnew <存储名> <设备名>     # 新建存储，例如 diskctl olnew /TWS-SD sda1
+```
+
+> **实测（两台）**：改指向 `sda2 → sda1 → sda2` 往返成功、路径逐次复核生效；
+> 指向**未挂载**的盘被拒；非法 id / 不含 `/` 的存储名 / 重名新建均被拒。
+> 主机上验证时 `/THW-4T → /mnt/sda2` 全程未动。
+
+⚠️ **改名后 WebDAV 地址会跟着变**：`/dav/THW-4T/` → `/dav/新名字/`，
+手机上的 owlfiles / CX 文件管理器要同步改地址，否则 404。
 
 ---
 
@@ -370,23 +423,41 @@ rm -rf /tmp/luci-indexcache /tmp/luci-modulecache
 
 ### 回滚
 
-两台都留了旧版备份：
-
 ```
-/root/oadbak/diskctl.old                     # v1.0.0 的
-/root/oadbak/diskctl.pre-listfix.old         # v1.1.0 的（树形归属修复前）
+/root/oadbak/v113/diskctl              # v1.1.3 的（改指向前最后一版）★ 首选
+/root/oadbak/v113/main.htm
+/root/oadbak/v113/openlist_assist.lua
+/root/oadbak/diskctl.old               # v1.0.0 的
+/root/oadbak/diskctl.pre-listfix.old   # v1.1.0 的（树形归属修复前）
 /root/oadbak/openlist_assist.lua.old
 /root/oadbak/main.htm.old
 /root/oadbak/openlist-assist.old
 ```
 
 ```sh
-cp /root/oadbak/diskctl.old /usr/bin/diskctl
-cp /root/oadbak/openlist_assist.lua.old /usr/lib/lua/luci/controller/openlist_assist.lua
-cp /root/oadbak/main.htm.old /usr/lib/lua/luci/view/openlist_assist/main.htm
+# 回到 v1.1.3
+cp /root/oadbak/v113/diskctl /usr/bin/diskctl
+cp /root/oadbak/v113/openlist_assist.lua /usr/lib/lua/luci/controller/openlist_assist.lua
+cp /root/oadbak/v113/main.htm /usr/lib/lua/luci/view/openlist_assist/main.htm
 chmod 755 /usr/bin/diskctl
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache && /etc/init.d/uhttpd restart
 ```
+
+> ⚠️ **踩过的坑：备份会被自己的部署脚本覆盖。**
+> 推送命令时 SSH 端**偶发把整条命令重复执行一遍**，于是「备份 → 解包」这套跑了两次，
+> 第二遍备份下来的其实是**刚铺好的新版** —— `/root/oadbak/v113/` 就成了空壳。
+> **现象**：`md5sum /root/oadbak/v113/diskctl` 与 `/usr/bin/diskctl` **完全相同**。
+> **对策**：部署后**必须比对"备份 vs 当前"的 md5**，两者不同才算备份成功。
+> 发现相同，就从 `dist/` 里的旧 ipk 重新提取（**注意 ipk 是三层嵌套**：
+> gzip → tar → 里面的 `data.tar.gz` 才是文件树，Mac 上 `ar` 解不了）。
+>
+> v1.1.3 的真实 md5（用来核对备份是不是真旧版）：
+>
+> ```
+> aa5924909dfd0e0c2447ecfa3b28d54f  diskctl
+> 464fc7d6afd40c55c3753615fa36c42f  main.htm
+> 69bdeaefd606bb92aae2a807b4308f57  openlist_assist.lua
+> ```
 
 `uninstall.sh` 只删界面 5 个文件，**绝不动** `mount-data-disk.sh` /
 `99-mount-data-disk` / `rc.local` / `fstab` / OpenList 配置 / 盘上数据。
@@ -399,9 +470,10 @@ rm -rf /tmp/luci-indexcache /tmp/luci-modulecache && /etc/init.d/uhttpd restart
 
 ## 十、已知限制 / 下一步
 
-1. **OpenList 存储的「编辑 / 删除」本页不做** —— 那是 OpenList 面板的职责，
-   本页只显示状态 + 给「打开面板」链接。想加可以在 `api_action` 里扩，
-   但要有意识地做（写操作风险高）。
+1. **OpenList 存储的「改名 / 删除」本页不做** —— 那是 OpenList 面板的职责。
+   本页只做两件写操作：**改指向**（§4.4）与**新建存储**。改名 / 删除仍去 OpenList 网页
+   （改名实测可行：一次性存储 `/RENAME-TEST` → `/RENAMED-OK` 成功、指向未丢；
+   注意改名后 WebDAV 路径跟着变）。
 2. **批量操作用逐个请求实现**，盘特别多时是 N 次请求。目前 ≤ 几块，够用。
 3. **eject 依赖桥接芯片支持软弹出**。Norelsys NS1066 支持；
    不支持的芯片会退化成「刷完缓存，直接拔是安全的」提示。

@@ -29,6 +29,10 @@
 #      `diskctl eject mmcblk0p27` 会顺着 parent 摸到 mmcblk0 并往
 #      /sys/block/mmcblk0/device/delete 写 1 —— 那是把系统盘拔了。
 #   7) 「全部挂载 / 全部卸载」只针对 USB 盘；内置盘归「内置存储」面板单独管。
+#   8) 改动 OpenList 存储（olmap / olnew）前必须先确认目标盘**已挂载** ——
+#      指向一个没挂上的路径，等于立刻制造一个「根路径未挂载」的坏存储。
+#      storage/update 收的是**完整对象**，所以必须先 GET 原对象、只改
+#      addition.root_folder_path、再整体回写；少字段会被清空。
 #
 #  ⚠️ 写这个脚本时踩过一次的坑：**中文全角标点紧跟变量名**会被 ash 当成变量名
 #     的一部分 → `unbound variable`，报错里变量名还是乱码，极难定位。
@@ -887,6 +891,183 @@ ol_storages_json() {
 	printf '{"ok":false,"err":"解析 OpenList 的返回失败（缺 jq？）","storage":[]}'
 }
 
+# 只读：取某个存储当前指向的根路径（改完复核用）
+ol_root_of() {   # $1=存储 id
+	tk="$(ol_token)" || return 1
+	[ -n "${tk}" ] || return 1
+	curl -s -m 8 -H "Authorization: ${tk}" "${OL_API}/api/admin/storage/get?id=$1" 2>/dev/null \
+		| jq -r '((.data.addition // "{}") | fromjson | .root_folder_path) // ""' 2>/dev/null
+}
+
+# ★ 挂载目标的挂载点。规则与 mnt_target 完全一致（内置白名单用固定目录，
+#   USB 盘用 /mnt/<设备名>），但**要求它此刻真的挂着** —— 没挂上就回空。
+#   改指向 / 新建存储都必须挂上才做，否则 OpenList 那边立刻是「根路径未挂载」。
+ol_target_mnt() {   # $1=设备名
+	[ -b "/dev/$1" ] || return 1
+	is_known "$1" || return 1
+	mnt="$(mnt_of "/dev/$1")"
+	[ -n "${mnt}" ] || return 1
+	printf '%s' "${mnt}"
+}
+
+# ---------------------------------------------------------------- 动作：改指向
+#
+# ★ 这是「换盘之后 OpenList 找不到盘」的正解。
+#   OpenList 的存储里存的是**一条路径**（不是设备名）。而本工具把 USB 盘挂到
+#   /mnt/<分区名> —— 设备名一变（盘符从 sda 变 sdb、或数据区从 sda1 变 sda2），
+#   挂载点跟着变，存储就指向了一个不存在的目录，WebDAV 里那个目录直接打不开。
+#   与其让你去网页上删了重建，不如就地把 root_folder_path 改过去。
+#
+#   ⚠️ storage/update 收的是**完整对象**，少字段会被清成空 ——
+#      所以必须先 GET 原对象，只改 addition.root_folder_path，再整体回写。
+#      （addition 是「字符串化的 JSON」，双层嵌套，是最容易写错的一处。）
+do_olmap() {
+	sid="$1"
+	dev="$2"
+
+	case "${sid}" in
+		''|*[!0-9]*) say "❌ 存储 id 得是数字：${sid}"; return 1 ;;
+	esac
+
+	tk="$(ol_token)"
+	[ -n "${tk}" ] || { say "❌ 读不到 OpenList 的 API 凭据（data.db 里没有 token 项）"; return 1; }
+	pidof openlist >/dev/null 2>&1 || { say "❌ OpenList 当前没有运行，先把它启起来"; return 1; }
+
+	mnt="$(ol_target_mnt "${dev}")"
+	if [ -z "${mnt}" ]; then
+		if [ -b "/dev/${dev}" ]; then
+			say "❌ /dev/${dev} 当前没有挂载 —— 先把它挂上（本页的开关，或 diskctl mount ${dev}），再来改指向。"
+		else
+			say "❌ /dev/${dev} 不存在（盘是不是被拔了？）"
+		fi
+		return 1
+	fi
+
+	tmpg="/tmp/.olget.$$"
+	tmpu="/tmp/.olupd.$$"
+	curl -s -m 8 -H "Authorization: ${tk}" "${OL_API}/api/admin/storage/get?id=${sid}" > "${tmpg}" 2>/dev/null
+	if ! grep -q '"code":200' "${tmpg}" 2>/dev/null; then
+		say "❌ 读不到存储 id=${sid}（接口回：$(head -c 140 "${tmpg}" 2>/dev/null)）"
+		rm -f "${tmpg}" "${tmpu}"
+		return 1
+	fi
+
+	nm="$(jq -r '.data.mount_path // ""' "${tmpg}" 2>/dev/null)"
+	old="$(jq -r '((.data.addition // "{}") | fromjson | .root_folder_path) // ""' "${tmpg}" 2>/dev/null)"
+
+	hr
+	say "【改指向】存储 ${nm}（id=${sid}）"
+	say "   ${old:-（空）}   →   ${mnt}"
+
+	jq -c --arg p "${mnt}" \
+		'.data | .addition = ((.addition // "{}") | fromjson | .root_folder_path = $p | tojson)' \
+		"${tmpg}" > "${tmpu}" 2>/dev/null
+	if [ ! -s "${tmpu}" ]; then
+		say "❌ 构造更新请求失败（缺 jq？）"
+		rm -f "${tmpg}" "${tmpu}"
+		return 1
+	fi
+
+	out="$(curl -s -m 20 -X POST -H "Authorization: ${tk}" -H "Content-Type: application/json" \
+		--data-binary @"${tmpu}" "${OL_API}/api/admin/storage/update" 2>&1)"
+	rm -f "${tmpg}" "${tmpu}"
+
+	case "${out}" in
+		*'"code":200'*) : ;;
+		*) say "❌ OpenList 拒绝了这次更新：${out}"; return 1 ;;
+	esac
+
+	after="$(ol_root_of "${sid}")"
+	if [ "${after}" = "${mnt}" ]; then
+		say "✅ 已改指向：存储 ${nm} 现在指向 ${mnt}"
+		say "   到 OpenList 面板刷新一下即可看到内容；若网页上没变，进「存储」点一次 停用→启用。"
+		return 0
+	fi
+	say "⚠️  接口说成功了，但复核读到的还是「${after}」—— 去 OpenList 面板手动刷新看看。"
+	return 1
+}
+
+# ---------------------------------------------------------------- 动作：新建存储
+#
+#   diskctl olnew <存储名> <设备名>      例如 diskctl olnew /TWS-SD sda1
+#   存储名就是 WebDAV 里显示的那个目录名，必须以 / 开头。
+do_olnew() {
+	mp="$1"
+	dev="$2"
+
+	case "${mp}" in
+		/*) : ;;
+		*) say "❌ 存储名要以 / 开头，例如 /TWS-SD"; return 1 ;;
+	esac
+	mp="$(printf '%s' "${mp}" | sed 's:/*$::')"
+	[ -n "${mp}" ] || { say "❌ 存储名不能只有斜杠"; return 1; }
+	case "${mp}" in
+		*'*'*|*'?'*|*'['*) say "❌ 存储名里不能带 * ? [ 这类字符"; return 1 ;;
+	esac
+
+	tk="$(ol_token)"
+	[ -n "${tk}" ] || { say "❌ 读不到 OpenList 的 API 凭据（data.db 里没有 token 项）"; return 1; }
+	pidof openlist >/dev/null 2>&1 || { say "❌ OpenList 当前没有运行，先把它启起来"; return 1; }
+
+	mnt="$(ol_target_mnt "${dev}")"
+	if [ -z "${mnt}" ]; then
+		if [ -b "/dev/${dev}" ]; then
+			say "❌ /dev/${dev} 当前没有挂载 —— 先把它挂上，再来建存储。"
+		else
+			say "❌ /dev/${dev} 不存在（盘是不是被拔了？）"
+		fi
+		return 1
+	fi
+
+	# 重名检查：mount_path 是 OpenList 的唯一键，撞了会回 500
+	exist="$(curl -s -m 8 -H "Authorization: ${tk}" "${OL_API}/api/admin/storage/list" 2>/dev/null \
+		| jq -r --arg m "${mp}" '[.data.content[] | select(.mount_path == $m)] | length' 2>/dev/null)"
+	case "${exist}" in
+		''|0) : ;;
+		*) say "❌ 已经有一个存储叫 ${mp} 了 —— 换个名字，或者直接用「改指向」。"; return 1 ;;
+	esac
+
+	hr
+	say "【新建存储】${mp}   →   ${mnt}（/dev/${dev}）"
+
+	tmpu="/tmp/.olnew.$$"
+	jq -nc --arg mp "${mp}" --arg root "${mnt}" '{
+		mount_path: $mp, order: 0, driver: "Local", cache_expiration: 30,
+		status: "work",
+		addition: ({ root_folder_path: $root, thumbnail: false,
+		            thumb_cache_folder: "", show_hidden: false,
+		            mkdir_perm: "777" } | tojson),
+		remark: "", web_proxy: false, webdav_policy: "native_proxy", down_proxy_url: ""
+	}' > "${tmpu}" 2>/dev/null
+	if [ ! -s "${tmpu}" ]; then
+		say "❌ 构造创建请求失败（缺 jq？）"
+		rm -f "${tmpu}"
+		return 1
+	fi
+
+	out="$(curl -s -m 20 -X POST -H "Authorization: ${tk}" -H "Content-Type: application/json" \
+		--data-binary @"${tmpu}" "${OL_API}/api/admin/storage/create" 2>&1)"
+	rm -f "${tmpu}"
+
+	case "${out}" in
+		*'"code":200'*) : ;;
+		*'UNIQUE constraint'*)
+			say "ℹ️  接口回了唯一约束冲突 —— 多半是已经建好了（同一条命令被执行两次的已知现象）。"
+			;;
+		*) say "❌ OpenList 拒绝了这次创建：${out}"; return 1 ;;
+	esac
+
+	chk="$(curl -s -m 8 -H "Authorization: ${tk}" "${OL_API}/api/admin/storage/list" 2>/dev/null \
+		| jq -r --arg m "${mp}" '.data.content[] | select(.mount_path == $m) | ((.addition|fromjson).root_folder_path)' 2>/dev/null)"
+	if [ "${chk}" = "${mnt}" ]; then
+		say "✅ 已建好：${mp} → ${mnt}"
+		say "   WebDAV 客户端刷新一下就能看到这个目录了。"
+		return 0
+	fi
+	say "⚠️  建完后复核没读到 —— 去 OpenList 面板刷新看看。"
+	return 1
+}
+
 # ---------------------------------------------------------------- 列表 / JSON
 
 # 分区的展示状态（do_list / child_list / 独立分区段共用）
@@ -1104,6 +1285,8 @@ case "${CMD}" in
 	eject)   do_eject "${DEV}" ;;
 	format)  do_format "${DEV}" "${FS}" ;;
 	openlist) do_openlist "${DEV}" ;;
+	olmap)   do_olmap "${DEV}" "${FS}" ;;
+	olnew)   do_olnew "${DEV}" "${FS}" ;;
 	tools)   do_tools ;;
 	list)    do_list ;;
 	json)    do_json ;;
@@ -1127,12 +1310,18 @@ diskctl — 硬盘管家（OpenList 助手后端）
   diskctl format  <dev> <fs>   格式化        --yes（fs: exfat|vfat|ext4）
   diskctl openlist start|stop  启停 OpenList
   diskctl olstorages           OpenList 的存储列表（JSON）
+  diskctl olmap   <id> <dev>   把某个 OpenList 存储改指向这块盘（须先挂载）
+  diskctl olnew   <名称> <dev> 新建一个存储指向这块盘，例如 olnew /TWS-SD sda1
   diskctl tools [--install]    工具自检 / 一键安装
   diskctl log [n]              看操作日志
 
   dev 写分区名即可，例如 sda2。
   内置 eMMC 数据分区（默认 mmcblk0p27）也在可操作范围内，
   挂载点固定为 /mnt/emmc；但格式化和弹出对它一律拒绝。
+
+  ★ 换盘之后 OpenList 找不到盘（网页上显示「根路径未挂载」）时：
+    先挂上盘，再 diskctl olmap <存储id> <设备名> 把指向改过去就行，
+    不用删掉重建（存储名、WebDAV 策略都会原样保留）。
 EOF
 		;;
 	*)

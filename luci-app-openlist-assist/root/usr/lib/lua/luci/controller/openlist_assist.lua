@@ -55,10 +55,38 @@ local function valid_fs(f)
 	return f == "exfat" or f == "vfat" or f == "ext4"
 end
 
+-- 「存储名」这类自由文本参数：允许中文、空格，但**绝不允许**任何能在单引号里
+-- 搞事的字符（引号 / $ / 反引号 / 分号 / 管道 / & / <> / 反斜杠 / 换行）。
+-- 真正的安全闸门在 diskctl 里，这里只是不让脏参数进命令行。
+local function valid_name(s)
+	if type(s) ~= "string" or #s == 0 or #s > 48 then return false end
+	if s:match("[\r\n\t]") then return false end
+	for _, c in ipairs({ "'", '"', "`", "$", ";", "|", "&", "<", ">", "\\" }) do
+		if s:find(c, 1, true) then return false end
+	end
+	return true
+end
+
+-- 给「已各自校验过参数」的调用用：不走 run() 那套严格字符集（那是给设备名用的，
+-- 会把中文挡掉），但仍逐个单引号包裹 + 再兜一层字符检查。
+local function run_q(args)
+	local parts = {}
+	for _, a in ipairs(args) do
+		if a and a ~= "" then
+			if a:find("'", 1, true) or a:find("[\r\n]", 1) then
+				return "❌ 内部错误：参数不合法"
+			end
+			parts[#parts + 1] = "'" .. a .. "'"
+		end
+	end
+	return sys.exec(table.concat(parts, " ") .. " 2>&1") or ""
+end
+
 -- 动作白名单：分两类，避免写一长串 if-else 还漏判
 local NEED_TARGET = {
 	mount = true, umount = true, clean = true, dirty = true,
 	eject = true, format = true,
+	ol_repoint = true, ol_new = true,
 }
 local NO_TARGET = {
 	mountall = true, umountall = true,
@@ -113,6 +141,8 @@ function api_action()
 	local act    = http.formvalue("action") or ""
 	local target = http.formvalue("target") or ""
 	local fsname = http.formvalue("fs") or ""
+	local sid    = http.formvalue("sid") or ""
+	local name   = http.formvalue("name") or ""
 	local bforce = http.formvalue("force") == "1"
 	local bro    = http.formvalue("ro") == "1"
 	local bstop  = http.formvalue("stop") == "1"
@@ -179,6 +209,24 @@ function api_action()
 		elseif act == "format" then
 			-- 类型已在校验区确认过，这里直接执行
 			out = run({ DISKCTL, "format", target, fsname, "--yes" })
+		elseif act == "ol_repoint" then
+			-- 改指向：把存储 <sid> 的根路径改成 <target> 现在的挂载点
+			if not sid:match("^%d+$") then
+				reply(false, "❌ 存储 id 不合法（得是数字）")
+				return
+			end
+			out = run({ DISKCTL, "olmap", sid, target })
+		elseif act == "ol_new" then
+			-- 新建存储：存储名是自由文本（可中文），单独校验
+			if not valid_name(name) then
+				reply(false, "❌ 存储名不合法（1~48 字，不能含引号 / $ / ; / | / & 等符号）")
+				return
+			end
+			if name:sub(1, 1) ~= "/" then
+				reply(false, "❌ 存储名要以 / 开头，例如 /TWS-SD")
+				return
+			end
+			out = run_q({ DISKCTL, "olnew", name, target })
 		else
 			reply(false, "❌ 未知操作：" .. act)
 			return

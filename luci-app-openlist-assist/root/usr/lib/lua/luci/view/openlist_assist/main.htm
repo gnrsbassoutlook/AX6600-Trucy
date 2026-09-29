@@ -152,6 +152,22 @@
 .oa-tbl td.mono { font-family:ui-monospace,Menlo,Consolas,monospace; word-break:break-all; }
 .oa-tbl tr:last-child td { border-bottom:none; }
 
+/* 「改指向 / 新建存储」的目标选择器 */
+.oa-olp { border:1px solid var(--oa-brand); border-radius:9px; padding:11px 12px;
+	margin-top:12px; background:var(--oa-bg2); }
+.oa-olp-t { font-size:12px; margin-bottom:9px; line-height:1.7; }
+.oa-olp-l { display:flex; flex-direction:column; gap:6px; margin-bottom:9px; }
+.oa-olp-i { display:flex; align-items:center; gap:9px; font-size:12px; padding:7px 10px;
+	border:1px solid var(--oa-line); border-radius:8px; background:var(--oa-bg); cursor:pointer;
+	flex-wrap:wrap; }
+.oa-olp-i:hover { border-color:var(--oa-brand); }
+.oa-olp-i.off { opacity:.5; cursor:not-allowed; }
+.oa-olp-i.off:hover { border-color:var(--oa-line); }
+.oa-olp-nm { display:flex; align-items:center; gap:9px; font-size:12px; margin-bottom:10px;
+	flex-wrap:wrap; }
+.oa-olp-nm input { font:inherit; font-size:12px; padding:5px 9px; border-radius:7px;
+	border:1px solid var(--oa-line); background:var(--oa-bg); color:var(--oa-fg); width:180px; }
+
 /* 结果打印 */
 .oa-term { background:var(--oa-bg2); border:1px solid var(--oa-line); border-radius:9px;
 	max-height:460px; overflow:auto; padding:10px 12px; }
@@ -245,12 +261,14 @@
 			<span class="oa-title">OpenList</span>
 			<span class="oa-sub" id="oa-ol-sub"></span>
 			<span class="oa-spacer"></span>
+			<button type="button" class="oa-btn" id="oa-ol-new">新建存储</button>
 			<button type="button" class="oa-btn oa-primary" id="oa-ol-start">启动</button>
 			<button type="button" class="oa-btn" id="oa-ol-stop">停止</button>
 			<a class="oa-btn" id="oa-ol-open" href="#" target="_blank" rel="noopener">打开面板</a>
 		</div>
 		<div class="oa-body">
 			<div id="oa-ol-body"></div>
+			<div id="oa-ol-pick"></div>
 		</div>
 	</div>
 
@@ -725,6 +743,7 @@
 		el("oa-ol-sub").textContent = ol.running ? ("运行中 · pid " + (ol.pid || "?")) : "已停止";
 		el("oa-ol-start").disabled = !!ol.running;
 		el("oa-ol-stop").disabled = !ol.running;
+		el("oa-ol-new").disabled = !ol.running;
 		try {
 			el("oa-ol-open").href = location.protocol + "//" + location.hostname + ":5244";
 		} catch (e) {}
@@ -749,11 +768,16 @@
 			var on = rootMounted && !s.disabled;
 			var state = s.disabled ? badge("已停用", "oa-b-idle")
 				: (rootMounted ? badge("在线", "oa-b-ok") : badge("根路径未挂载", "oa-b-oldown"));
+			/* ★ 根路径没挂上 → 把「改指向」做成主按钮：一眼就知道该点哪儿救 */
+			var mapCls = rootMounted ? "" : " oa-primary";
 			return "<tr>"
 				+ '<td class="mono">' + esc(s.mount_path) + "</td>"
 				+ "<td>" + esc(s.driver) + "</td>"
 				+ '<td class="mono">' + esc(s.root || "—") + "</td>"
 				+ "<td>" + state + "</td>"
+				+ '<td><button type="button" class="oa-btn oa-mini' + mapCls
+				+ '" data-olmap="' + esc(s.id) + '" title="换盘之后路径变了？把指向改到别的盘上">'
+				+ "改指向…</button></td>"
 				+ "</tr>";
 		}).join("");
 
@@ -763,13 +787,141 @@
 
 		el("oa-ol-body").innerHTML =
 			'<table class="oa-tbl"><thead><tr><th>存储（挂载路径）</th><th>类型</th>'
-			+ "<th>实际根路径</th><th>状态</th></tr></thead><tbody>" + rows + "</tbody></table>"
+			+ "<th>实际根路径</th><th>状态</th><th>操作</th></tr></thead><tbody>" + rows + "</tbody></table>"
 			+ '<div class="oa-note" style="margin:12px 0 0">'
 			+ "OpenList 的存储并不会「挂载」任何东西 —— 它只是<b>指向一个本地路径</b>。"
 			+ "所以盘一卸载，对应的存储就会变成「根路径未挂载」，网页上那里会报错。"
 			+ "本页的开关在这种盘上会自动帮你先停 OpenList、卸完再拉回来。</div>"
 			+ (downCount ? '<div class="oa-err" style="margin-top:10px">有 ' + downCount
-				+ " 个存储的根路径当前没挂载，OpenList 里那两个目录是打不开的。</div>" : "");
+				+ " 个存储的根路径当前没挂载，OpenList 里那两个目录是打不开的。"
+				+ "换了盘的话点右边的「改指向…」把它指到新盘上即可。</div>" : "");
+	}
+
+	/* ------------------------------------------- 改指向 / 新建存储 选择器 */
+	/*
+	   为什么不做成「sda 下拉 1~9」那种：
+	     ① 分区号不一定从 1 连号（扩展分区盘常见 sda1 + sda5）；
+	     ② **盘符字母会变** —— 同一块盘换个 USB 口就可能从 sda 变 sdb；
+	     ③ 小 U 盘常常没有分区表，文件系统直接建在整盘上（就是 sda 本身，没有数字）。
+	   固定 1~9 会列出一堆不存在的选项，反而更容易选错。
+	   所以这里**动态列当前真实存在的盘** —— 你插什么盘，列表里就出现什么。
+	*/
+
+	var OL_PICK = null;      /* { mode: "repoint" | "new", id: N } */
+
+	/* 能当 OpenList 存储目标的：USB 分区/整盘（得有文件系统）+ 内置白名单盘 */
+	function olTargets() {
+		return (S.devs || []).filter(function (x) {
+			if (x.kind === "internal" || x.kind === "ipart") { return true; }
+			return (x.kind === "part" || x.kind === "disk") && !!x.fstype;
+		});
+	}
+
+	/* 这个目标挂上之后会落在哪 —— 与 diskctl 的 mnt_target() 规则一致 */
+	function olTargetPath(x) {
+		if (x.mounted && x.mount) { return x.mount; }
+		if (x.kind === "internal" || x.kind === "ipart") { return S.internalMnt; }
+		return "/mnt/" + x.name;
+	}
+
+	function openPicker(mode, id) {
+		OL_PICK = { mode: mode, id: id };
+		renderPicker();
+	}
+
+	function closePicker() {
+		OL_PICK = null;
+		el("oa-ol-pick").innerHTML = "";
+	}
+
+	function renderPicker() {
+		var box = el("oa-ol-pick");
+		if (!OL_PICK) { box.innerHTML = ""; return; }
+
+		var list = olTargets();
+		if (!list.length) {
+			box.innerHTML = '<div class="oa-err">当前没有任何可选目标 —— 先插一块盘并挂上，'
+				+ "或者把内置 eMMC 挂上（本页「内置存储」面板），再回来选。</div>";
+			OL_PICK = null;
+			return;
+		}
+
+		var st = null;
+		if (OL_PICK.mode === "repoint" && S.storages && S.storages.ok) {
+			S.storages.storage.forEach(function (s) {
+				if (String(s.id) === String(OL_PICK.id)) { st = s; }
+			});
+		}
+
+		var head = (OL_PICK.mode === "repoint")
+			? ('把存储 <b class="oa-mono">' + esc(st ? st.mount_path : ("id=" + OL_PICK.id))
+			   + '</b> 改指向哪块盘？　（现在指向 <b class="oa-mono">'
+			   + esc((st && st.root) || "—") + "</b>）")
+			: "新建一个存储，指向哪块盘？";
+
+		var opts = list.map(function (x) {
+			var p = olTargetPath(x);
+			var cur = (OL_PICK.mode === "repoint" && st && st.root === p);
+			var dis = !x.mounted;
+			var isInt = (x.kind === "internal" || x.kind === "ipart");
+			return '<label class="oa-olp-i' + (dis ? " off" : "") + '">'
+				+ '<input type="radio" name="oa-olp-t" value="' + esc(x.name) + '"'
+				+ (dis ? " disabled" : (cur ? " checked" : "")) + ">"
+				+ '<span class="oa-mono">' + esc(x.name) + "</span>"
+				+ '<span class="oa-mono">' + esc(p) + "</span>"
+				+ '<span class="oa-dim">' + esc(x.fstype || "?") + " · " + esc(x.size_h || "") + "</span>"
+				+ (isInt ? badge("内置 eMMC", "oa-b-fs") : "")
+				+ (dis ? '<span class="oa-dim">未挂载 —— 先把它挂上</span>'
+				       : (cur ? badge("当前", "oa-b-ok") : ""))
+				+ "</label>";
+		}).join("");
+
+		var nameRow = (OL_PICK.mode === "new")
+			? ('<div class="oa-olp-nm"><span>存储名（WebDAV 里显示的目录名）</span>'
+			   + '<input type="text" id="oa-olp-name" placeholder="/TWS-SD" value=""></div>')
+			: "";
+
+		box.innerHTML = '<div class="oa-olp">'
+			+ '<div class="oa-olp-t">' + head + "</div>"
+			+ nameRow
+			+ '<div class="oa-olp-l">' + opts + "</div>"
+			+ '<div class="oa-dim" style="margin-bottom:9px">灰色的是没挂上的盘 —— '
+			+ "OpenList 只认路径，指向一块没挂的盘，那个目录在网盘里就是打不开的。</div>"
+			+ '<div class="oa-actions">'
+			+ '<button type="button" class="oa-btn oa-primary" data-olp="ok">确定</button>'
+			+ '<button type="button" class="oa-btn oa-ghost" data-olp="cancel">取消</button>'
+			+ "</div></div>";
+
+		/* 一个都没默认勾中（比如原路径那块盘已经拔了）→ 自动勾第一个可用的 */
+		if (!document.querySelector('input[name="oa-olp-t"]:checked')) {
+			var firstOk = document.querySelector('input[name="oa-olp-t"]:not([disabled])');
+			if (firstOk) { firstOk.checked = true; }
+		}
+	}
+
+	function olPickOk() {
+		if (!OL_PICK) { return; }
+		var sel = document.querySelector('input[name="oa-olp-t"]:checked');
+		if (!sel) { toast("先选一块盘", "bad"); return; }
+		var dev = sel.value;
+
+		if (OL_PICK.mode === "repoint") {
+			var id = OL_PICK.id;
+			closePicker();
+			runAction("ol_repoint", { target: dev, sid: String(id) }, "改指向 → " + dev);
+			return;
+		}
+
+		var nmEl = el("oa-olp-name");
+		var nm = nmEl ? String(nmEl.value || "").replace(/^\s+|\s+$/g, "") : "";
+		if (nm.indexOf("/") !== 0) {
+			toast("存储名要以 / 开头，例如 /TWS-SD", "bad");
+			if (nmEl) { nmEl.focus(); }
+			return;
+		}
+		if (nm.length > 48) { toast("存储名太长了（48 字以内）", "bad"); return; }
+		closePicker();
+		runAction("ol_new", { target: dev, name: nm }, "新建存储 " + nm);
 	}
 
 	/* ---------------------------------------------------------- 载入 */
@@ -811,6 +963,8 @@
 			renderInternal(d);
 			renderBatch();
 			renderOpenList(d);
+			/* 选择器开着的时候，盘插拔了也要跟着更新选项 */
+			if (OL_PICK) { renderPicker(); }
 		});
 	}
 
@@ -918,6 +1072,17 @@
 		var act = t.getAttribute("data-act");
 		var dev = t.getAttribute("data-dev");
 
+		/* OpenList 存储：改指向 / 选择器里的确定·取消 */
+		var olm = t.getAttribute("data-olmap");
+		if (olm) { e.preventDefault(); openPicker("repoint", olm); return; }
+
+		var olp = t.getAttribute("data-olp");
+		if (olp) {
+			e.preventDefault();
+			if (olp === "ok") { olPickOk(); } else { closePicker(); }
+			return;
+		}
+
 		if (fmt) {
 			e.preventDefault();
 			var fsName = { exfat: "exFAT", vfat: "FAT32", ext4: "ext4" }[fmt] || fmt;
@@ -975,6 +1140,7 @@
 			renderBatch();
 		};
 
+		el("oa-ol-new").onclick = function () { openPicker("new", null); };
 		el("oa-ol-start").onclick = function () { runAction("openlist_start", {}, "启动 OpenList"); };
 		el("oa-ol-stop").onclick = function () { runAction("openlist_stop", {}, "停止 OpenList"); };
 
