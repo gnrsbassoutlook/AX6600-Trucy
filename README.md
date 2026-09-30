@@ -247,6 +247,7 @@ diskctl tools [--install] / log 60             # 工具自检一键装 / 看操�
 | `孩子设备换IP-movekid.sh` | 单台孩子设备换 IP |
 | `ADH上游改为本机分流-set_adh_upstream.sh` | 把 ADH 上游切到本机分流链 |
 | `扶正迁移-migrate-host.sh` | 主从角色互换时的迁移 |
+| `openlist-fix-webdav-write.sh` | **修 OpenList「WebDAV 能读不能写（403）」**：登录 → 读权限位 → 只加 bit9(512) → 回写 → 复验，可选 WebDAV 真写实测。**上游默认 `0x71FF` 缺 bit9，装完就坏**。详见 `docs/OpenList-WebDAV写入403-根因与修复.md` |
 
 前三个是给 OpenList 配「实体硬盘」的最小集（4T 盘 → `/mnt/sda2` → OpenList 存储 →
 WebDAV，断电自动挂回来），配 `docs/OpenList-4T硬盘挂载-操作说明.md` 用。
@@ -257,6 +258,7 @@ WebDAV，断电自动挂回来），配 `docs/OpenList-4T硬盘挂载-操作说�
 |---|---|
 | `OpenList助手-界面与联动说明.md` | **插件一的完整说明书**：开关语义、批量范围、OpenList 联动、**换盘改指向**、内置 eMMC、安全边界、格式矩阵、部署回滚 |
 | `OpenList-4T硬盘挂载-操作说明.md` | 把 4T 实体盘挂进 OpenList（含 WebDAV、热插拔、开机自动挂） |
+| `OpenList-WebDAV写入403-根因与修复.md` | **WebDAV 写入 403 的真根因**：上游 admin 默认权限位 `0x71FF` 缺 bit9（WebDAV 写入）。完整权限位表、三种修法、三层验证（协议/挂载点/物理盘）、`/dav` 虚拟根不能写文件的坑 |
 | `ADH按IP控制-防火墙规则速查.md` | 双锚规则的速查表 |
 | `副路由器192.168.3.1-ADH过滤操作说明.md` | 在另一台机器上从零配过滤（含五个坑） |
 | `孩子设备过滤-自己动手操作手册.md` | 手工操作版 |
