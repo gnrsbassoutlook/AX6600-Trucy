@@ -131,7 +131,7 @@ for b in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
 		12) name="读取压缩包" ;; 13) name="解压压缩包" ;; 14) name="分享" ;;
 	esac
 	if [ $(( ${perm} & v )) -ne 0 ]; then mark="[√]"; else mark="[ ]"; fi
-	[ "${b}" = 9 ] && mark="${mark} ◀ 缺的就是它"
+	if [ "${b}" = 9 ] && [ $(( ${perm} & 512 )) -eq 0 ]; then mark="${mark} ◀ 缺的就是它"; fi
 	printf '  bit%-2s %-5s %-18s %s\n' "$b" "$v" "${name}" "${mark}"
 done
 
